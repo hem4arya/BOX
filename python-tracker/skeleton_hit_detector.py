@@ -1,20 +1,241 @@
 """
-Skeleton-Based Hit Detector with Depth Awareness
-=================================================
-SIMPLE approach: If hand moves fast enough, it's a HIT.
-DEPTH: Detect if movement is FORWARD (toward camera), SIDEWAYS, or IDLE.
+Skeleton-Based Hit Detector with Advanced Signal Processing
+============================================================
+PHYSICS-BASED detection using:
+1. MediaPipe Pose skeleton (shoulder → elbow → wrist)
+2. Anthropometric depth (Pythagoras: Z = sqrt(L² - P²))
+3. Elbow angle gating (bent arm = guard, straight = punch)
 
-Physics-based detection:
-- Track wrist position from skeleton (reliable from MediaPipe Pose)
-- Calculate velocity (pixels per second)
-- Analyze movement DIRECTION using Z-coordinate and position changes
-- If velocity > threshold AND moving forward = PUNCH!
+QUICK WINS:
+4. Direction consistency (dot product of velocity vectors)
+5. Kinetic energy profile (KE = 0.5 × v²)
+6. Trajectory phase detection (ACCEL → PEAK → DECEL → IDLE)
+
+MEDIUM EFFORT:
+7. Lucas-Kanade optical flow for motion validation
+8. Kalman Filter for state estimation [x, y, vx, vy, ax, ay]
 """
 
 import numpy as np
+import cv2
 from collections import deque
 import time
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# MEDIUM EFFORT #2: Kalman Filter State Estimator
+# ════════════════════════════════════════════════════════════════════════════
+class KalmanStateEstimator:
+    """
+    Kalman Filter for hand state estimation.
+    
+    State vector: [x, y, vx, vy, ax, ay]
+    - x, y: Position (normalized)
+    - vx, vy: Velocity
+    - ax, ay: Acceleration
+    
+    Fuses skeleton measurements with physics-based motion model.
+    """
+    
+    def __init__(self, process_noise=0.01, measurement_noise=0.1):
+        # State: [x, y, vx, vy, ax, ay]
+        self.state = np.zeros(6)
+        
+        # State transition matrix (constant acceleration model)
+        # dt will be applied each update
+        self.F = np.eye(6)
+        
+        # Measurement matrix (we observe x, y)
+        self.H = np.zeros((2, 6))
+        self.H[0, 0] = 1  # x
+        self.H[1, 1] = 1  # y
+        
+        # Covariance matrix
+        self.P = np.eye(6) * 0.1
+        
+        # Process noise (model uncertainty)
+        self.Q = np.eye(6) * process_noise
+        
+        # Measurement noise (sensor uncertainty)
+        self.R = np.eye(2) * measurement_noise
+        
+        self.initialized = False
+        self.last_time = None
+    
+    def predict(self, dt):
+        """Predict next state based on motion model."""
+        # Update state transition matrix with dt
+        self.F = np.array([
+            [1, 0, dt, 0, 0.5*dt**2, 0],
+            [0, 1, 0, dt, 0, 0.5*dt**2],
+            [0, 0, 1, 0, dt, 0],
+            [0, 0, 0, 1, 0, dt],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1]
+        ])
+        
+        # Predict state
+        self.state = self.F @ self.state
+        
+        # Predict covariance
+        self.P = self.F @ self.P @ self.F.T + self.Q
+    
+    def update(self, measurement, timestamp=None):
+        """
+        Update state with new measurement.
+        
+        Args:
+            measurement: [x, y] position observation
+            timestamp: Optional timestamp for dt calculation
+        """
+        if not self.initialized:
+            self.state[0] = measurement[0]
+            self.state[1] = measurement[1]
+            self.initialized = True
+            self.last_time = timestamp or time.time()
+            return self.state.copy()
+        
+        # Calculate dt
+        current_time = timestamp or time.time()
+        dt = max(0.001, current_time - self.last_time) if self.last_time else 0.033
+        self.last_time = current_time
+        
+        # Predict step
+        self.predict(dt)
+        
+        # Measurement residual
+        z = np.array(measurement)
+        y = z - self.H @ self.state
+        
+        # Kalman gain
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        
+        # Update state
+        self.state = self.state + K @ y
+        
+        # Update covariance
+        I = np.eye(6)
+        self.P = (I - K @ self.H) @ self.P
+        
+        return self.state.copy()
+    
+    def get_velocity(self):
+        """Get estimated velocity [vx, vy]."""
+        return self.state[2:4].copy()
+    
+    def get_acceleration(self):
+        """Get estimated acceleration [ax, ay]."""
+        return self.state[4:6].copy()
+    
+    def get_speed(self):
+        """Get velocity magnitude."""
+        return np.linalg.norm(self.state[2:4])
+    
+    def reset(self):
+        """Reset filter state."""
+        self.state = np.zeros(6)
+        self.P = np.eye(6) * 0.1
+        self.initialized = False
+        self.last_time = None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MEDIUM EFFORT #1: Optical Flow Tracker
+# ════════════════════════════════════════════════════════════════════════════
+class OpticalFlowTracker:
+    """
+    Lucas-Kanade optical flow for motion validation.
+    
+    Tracks specific points (wrists) using sparse optical flow.
+    Provides motion validation independent of skeleton detection.
+    """
+    
+    def __init__(self):
+        # Lucas-Kanade parameters
+        self.lk_params = dict(
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
+        )
+        
+        self.prev_gray = None
+        self.prev_points = {'Left': None, 'Right': None}
+        self.flow_velocity = {'Left': np.zeros(2), 'Right': np.zeros(2)}
+    
+    def update(self, gray_frame, skeleton_points):
+        """
+        Update optical flow with new frame.
+        
+        Args:
+            gray_frame: Grayscale frame (H, W)
+            skeleton_points: Dict with 'Left' and 'Right' wrist positions as (x, y) pixels
+        
+        Returns:
+            Dict with flow velocities for each hand
+        """
+        results = {'Left': np.zeros(2), 'Right': np.zeros(2)}
+        
+        if self.prev_gray is None:
+            self.prev_gray = gray_frame.copy()
+            for hand in ['Left', 'Right']:
+                if hand in skeleton_points and skeleton_points[hand] is not None:
+                    pt = skeleton_points[hand]
+                    self.prev_points[hand] = np.array([[pt]], dtype=np.float32)
+            return results
+        
+        for hand in ['Left', 'Right']:
+            if hand not in skeleton_points or skeleton_points[hand] is None:
+                continue
+            
+            current_pt = skeleton_points[hand]
+            
+            if self.prev_points[hand] is not None:
+                # Track previous point forward
+                next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                    self.prev_gray, gray_frame,
+                    self.prev_points[hand], None,
+                    **self.lk_params
+                )
+                
+                if status[0][0] == 1:
+                    # Calculate flow velocity
+                    flow = next_pts[0][0] - self.prev_points[hand][0][0]
+                    results[hand] = flow
+                    self.flow_velocity[hand] = flow
+            
+            # Update tracking point from skeleton
+            self.prev_points[hand] = np.array([[current_pt]], dtype=np.float32)
+        
+        self.prev_gray = gray_frame.copy()
+        return results
+    
+    def get_flow_magnitude(self, hand):
+        """Get magnitude of optical flow for hand."""
+        return np.linalg.norm(self.flow_velocity[hand])
+    
+    def validate_skeleton_movement(self, hand, skeleton_velocity, threshold=0.5):
+        """
+        Validate skeleton-based velocity with optical flow.
+        
+        Returns True if optical flow agrees with skeleton movement.
+        """
+        flow_vel = np.linalg.norm(self.flow_velocity[hand])
+        skel_vel = np.linalg.norm(skeleton_velocity)
+        
+        if skel_vel < 0.01:  # No skeleton movement
+            return True
+        
+        # Check if flow velocity is in same ballpark as skeleton velocity
+        # (allowing for scale differences)
+        ratio = flow_vel / (skel_vel * 1000 + 0.001)  # Scale normalization
+        return ratio > threshold
+    
+    def reset(self):
+        """Reset optical flow state."""
+        self.prev_gray = None
+        self.prev_points = {'Left': None, 'Right': None}
+        self.flow_velocity = {'Left': np.zeros(2), 'Right': np.zeros(2)}
 
 class SkeletonHitDetector:
     """
@@ -45,6 +266,12 @@ class SkeletonHitDetector:
         
         # Position history for velocity and depth calculation
         self.position_history = {
+            'Left': deque(maxlen=8),  # Increased for velocity vector tracking
+            'Right': deque(maxlen=8)
+        }
+        
+        # Velocity vector history for direction consistency
+        self.velocity_vectors = {
             'Left': deque(maxlen=5),
             'Right': deque(maxlen=5)
         }
@@ -62,6 +289,39 @@ class SkeletonHitDetector:
         self.last_depth_change = {'Left': 0, 'Right': 0}
         self.last_depth_percent = {'Left': 0, 'Right': 0}
         self.last_anthropometric_depth = {'Left': 0, 'Right': 0}
+        
+        # ════════════════════════════════════════════════════════════════
+        # QUICK WINS: Advanced Signal Processing
+        # ════════════════════════════════════════════════════════════════
+        
+        # 1. Direction Consistency - dot product of velocity vectors
+        self.last_direction_consistency = {'Left': 0, 'Right': 0}
+        
+        # 2. Kinetic Energy Profile - KE = 0.5 * m * v²
+        self.last_kinetic_energy = {'Left': 0, 'Right': 0}
+        self.peak_kinetic_energy = {'Left': 0, 'Right': 0}  # Track peak for ballistic profile
+        
+        # 3. Trajectory Phase - acceleration/deceleration detection
+        self.trajectory_phase = {'Left': 'IDLE', 'Right': 'IDLE'}  # ACCEL, PEAK, DECEL, IDLE
+        self.last_acceleration = {'Left': 0, 'Right': 0}
+        
+        # ════════════════════════════════════════════════════════════════
+        # MEDIUM EFFORT: Optical Flow + Kalman Filter
+        # ════════════════════════════════════════════════════════════════
+        
+        # Kalman Filters for each hand (state: [x, y, vx, vy, ax, ay])
+        self.kalman = {
+            'Left': KalmanStateEstimator(process_noise=0.005, measurement_noise=0.05),
+            'Right': KalmanStateEstimator(process_noise=0.005, measurement_noise=0.05)
+        }
+        
+        # Optical Flow Tracker (validates skeleton movement)
+        self.optical_flow = OpticalFlowTracker()
+        
+        # Kalman-filtered values for debug
+        self.kalman_velocity = {'Left': np.zeros(2), 'Right': np.zeros(2)}
+        self.kalman_accel = {'Left': np.zeros(2), 'Right': np.zeros(2)}
+        self.flow_validated = {'Left': False, 'Right': False}
         
         # ═══════════════════════════════════════════════════════════════
         # ANTHROPOMETRIC DEPTH CALIBRATION
@@ -153,6 +413,118 @@ class SkeletonHitDetector:
         depth_percent = min(100.0, depth_percent)  # Cap at 100%
         
         return depth, depth_percent
+    
+    # ════════════════════════════════════════════════════════════════════
+    # QUICK WIN #1: Direction Consistency
+    # ════════════════════════════════════════════════════════════════════
+    def calculate_direction_consistency(self, hand):
+        """
+        Check if velocity vectors are pointing in consistent direction.
+        
+        Uses dot product of consecutive velocity vectors.
+        High consistency (close to 1.0) = hand moving in one direction
+        Low consistency (close to 0 or negative) = erratic movement
+        
+        Returns: 0.0 to 1.0 (1.0 = perfectly consistent direction)
+        """
+        vectors = list(self.velocity_vectors[hand])
+        if len(vectors) < 3:
+            return 0.0
+        
+        # Calculate average dot product between consecutive vectors
+        total_consistency = 0.0
+        count = 0
+        
+        for i in range(1, len(vectors)):
+            v1 = vectors[i-1]
+            v2 = vectors[i]
+            
+            # Normalize vectors
+            mag1 = np.linalg.norm(v1)
+            mag2 = np.linalg.norm(v2)
+            
+            if mag1 > 0.001 and mag2 > 0.001:
+                dot = np.dot(v1, v2) / (mag1 * mag2)
+                total_consistency += max(0, dot)  # Only count positive consistency
+                count += 1
+        
+        if count == 0:
+            return 0.0
+        
+        consistency = total_consistency / count
+        self.last_direction_consistency[hand] = consistency
+        return consistency
+    
+    # ════════════════════════════════════════════════════════════════════
+    # QUICK WIN #2: Kinetic Energy Profile
+    # ════════════════════════════════════════════════════════════════════
+    def calculate_kinetic_energy(self, velocity, hand):
+        """
+        Calculate kinetic energy proxy: KE = 0.5 * v²
+        
+        High KE indicates forceful strike intent.
+        We use velocity squared as a proxy (mass is constant).
+        
+        Returns: Normalized kinetic energy (0.0 to 1.0)
+        """
+        # KE proportional to v² (we don't know actual mass)
+        ke = 0.5 * velocity**2
+        
+        # Normalize to 0-1 range (threshold velocity = 0.1, max expected ~0.3)
+        ke_normalized = min(1.0, ke / 0.045)  # 0.5 * 0.3² = 0.045
+        
+        self.last_kinetic_energy[hand] = ke_normalized
+        
+        # Track peak for ballistic profile detection
+        if ke_normalized > self.peak_kinetic_energy[hand]:
+            self.peak_kinetic_energy[hand] = ke_normalized
+        else:
+            # Decay peak slowly
+            self.peak_kinetic_energy[hand] *= 0.95
+        
+        return ke_normalized
+    
+    # ════════════════════════════════════════════════════════════════════
+    # QUICK WIN #3: Trajectory Phase Detection
+    # ════════════════════════════════════════════════════════════════════
+    def detect_trajectory_phase(self, velocity, prev_velocity, hand):
+        """
+        Detect if hand is in ACCEL, PEAK, DECEL, or IDLE phase.
+        
+        Ballistic punch profile:
+        1. ACCEL: Velocity increasing rapidly
+        2. PEAK: Maximum velocity reached
+        3. DECEL: Velocity decreasing (contact/retraction)
+        4. IDLE: Low velocity, no significant movement
+        
+        Returns: 'ACCEL', 'PEAK', 'DECEL', or 'IDLE'
+        """
+        # Calculate acceleration (change in velocity)
+        acceleration = velocity - prev_velocity
+        self.last_acceleration[hand] = acceleration
+        
+        # Thresholds
+        IDLE_VELOCITY = 0.03
+        ACCEL_THRESHOLD = 0.015
+        DECEL_THRESHOLD = -0.015
+        
+        prev_phase = self.trajectory_phase[hand]
+        
+        if velocity < IDLE_VELOCITY:
+            phase = 'IDLE'
+            # Reset peak tracking when idle
+            self.peak_kinetic_energy[hand] = 0
+        elif acceleration > ACCEL_THRESHOLD:
+            phase = 'ACCEL'
+        elif acceleration < DECEL_THRESHOLD:
+            phase = 'DECEL'
+        elif prev_phase == 'ACCEL' and acceleration < ACCEL_THRESHOLD:
+            phase = 'PEAK'  # Just passed peak velocity
+        else:
+            phase = prev_phase  # Maintain current phase
+        
+        self.trajectory_phase[hand] = phase
+        return phase
     
     def _get_arm_geometry(self, pose_landmarks, hand):
         """
@@ -295,12 +667,17 @@ class SkeletonHitDetector:
             timestamp: Optional timing info
             
         Returns:
-            dict with hit events, velocity, direction, depth percent, and elbow angle
+            dict with hit events, velocity, direction, depth, elbow angle, and quick wins
         """
         self.frame_count += 1
+        base_result = {
+            'hit': False, 'velocity': 0, 'direction': 'IDLE', 'depth_change': 0, 
+            'depth_percent': 0, 'elbow_angle': 90, 'is_straight': False,
+            'direction_consistency': 0, 'kinetic_energy': 0, 'trajectory_phase': 'IDLE'
+        }
         results = {
-            'Left': {'hit': False, 'velocity': 0, 'direction': 'IDLE', 'depth_change': 0, 'depth_percent': 0, 'elbow_angle': 90},
-            'Right': {'hit': False, 'velocity': 0, 'direction': 'IDLE', 'depth_change': 0, 'depth_percent': 0, 'elbow_angle': 90}
+            'Left': base_result.copy(),
+            'Right': base_result.copy()
         }
         
         if pose_landmarks is None:
@@ -351,11 +728,49 @@ class SkeletonHitDetector:
             if len(self.position_history[hand]) < 2:
                 continue
             
-            # Calculate velocity (change from previous frame)
+            # Calculate velocity vector and magnitude
             prev_pos = self.position_history[hand][-2]['pos']
-            velocity = np.linalg.norm(current_pos - prev_pos)
+            velocity_vector = current_pos - prev_pos
+            raw_velocity = np.linalg.norm(velocity_vector)
             
-            # Detect direction
+            # ════════════════════════════════════════════════════════════
+            # MEDIUM EFFORT: Kalman Filter Integration
+            # ════════════════════════════════════════════════════════════
+            
+            # Update Kalman filter with position measurement
+            current_time = timestamp or time.time()
+            kalman_state = self.kalman[hand].update([wrist.x, wrist.y], current_time)
+            
+            # Get Kalman-smoothed velocity and acceleration
+            kalman_vel = self.kalman[hand].get_velocity()
+            kalman_accel = self.kalman[hand].get_acceleration()
+            kalman_speed = self.kalman[hand].get_speed()
+            
+            # Store for debug
+            self.kalman_velocity[hand] = kalman_vel
+            self.kalman_accel[hand] = kalman_accel
+            
+            # Use Kalman-smoothed speed for hit detection (more stable)
+            velocity = kalman_speed * 10  # Scale to match raw velocity range
+            
+            # ════════════════════════════════════════════════════════════
+            # QUICK WINS INTEGRATION
+            # ════════════════════════════════════════════════════════════
+            
+            # Store velocity vector for direction consistency
+            self.velocity_vectors[hand].append(velocity_vector)
+            
+            # Quick Win #1: Direction Consistency
+            direction_consistency = self.calculate_direction_consistency(hand)
+            
+            # Quick Win #2: Kinetic Energy (using Kalman velocity for smoothness)
+            kinetic_energy = self.calculate_kinetic_energy(velocity, hand)
+            
+            # Quick Win #3: Trajectory Phase
+            prev_velocity = self.last_velocity.get(hand, 0)
+            trajectory_phase = self.detect_trajectory_phase(velocity, prev_velocity, hand)
+            
+            # Detect direction (legacy)
             direction, depth_change = self._detect_direction(
                 self.position_history[hand],
                 current_pos,
@@ -371,44 +786,54 @@ class SkeletonHitDetector:
             # ════════════════════════════════════════════════════════════
             # ELBOW ANGLE GATING
             # ════════════════════════════════════════════════════════════
-            # Problem: Bent guard arm has short 2D distance (like forward punch)
-            # Solution: Use elbow angle to disambiguate!
-            # Bent arm (< 130°) = GUARD = effective_depth 0%
-            # Straight arm (> 130°) = COULD BE PUNCH = use calculated depth
-            
             ELBOW_THRESHOLD = 130  # Degrees - below this is considered "bent"
             
             if elbow_angle < ELBOW_THRESHOLD:
-                # Arm is BENT = guard position = no forward extension
                 effective_depth = 0.0
             else:
-                # Arm is STRAIGHT = scale depth by how straight (130° -> 0%, 180° -> 100%)
-                straightness = (elbow_angle - 90) / 90  # 90° -> 0, 180° -> 1
+                straightness = (elbow_angle - 90) / 90
                 straightness = max(0, min(1, straightness))
                 effective_depth = anthro_depth_percent * straightness
             
             # Store the gated depth
             self.last_depth_percent[hand] = effective_depth
             
+            # Populate results with all metrics
             results[hand]['velocity'] = velocity
             results[hand]['direction'] = direction
             results[hand]['depth_change'] = depth_change
-            results[hand]['depth_percent'] = effective_depth  # GATED by elbow angle!
+            results[hand]['depth_percent'] = effective_depth
             results[hand]['elbow_angle'] = elbow_angle
             results[hand]['is_straight'] = elbow_angle >= ELBOW_THRESHOLD
             
+            # Quick win results
+            results[hand]['direction_consistency'] = direction_consistency
+            results[hand]['kinetic_energy'] = kinetic_energy
+            results[hand]['trajectory_phase'] = trajectory_phase
+            
             # ════════════════════════════════════════════════════════════
-            # HIT DETECTION: Velocity + Elbow Angle Gated Depth
+            # ENHANCED HIT DETECTION (with Quick Wins!)
             # ════════════════════════════════════════════════════════════
-            # PUNCH = fast movement + arm STRAIGHT + depth > 40%
+            # PUNCH = fast + straight + forward depth + consistent direction
+            # + ballistic trajectory (ACCEL or PEAK phase)
+            
             in_cooldown = (self.frame_count - self.last_hit_frame[hand]) < self.cooldown_frames
             
             is_fast = velocity > self.velocity_threshold
-            is_straight = elbow_angle >= ELBOW_THRESHOLD  # NEW: require straight arm
-            is_forward = effective_depth > 40  # Using gated depth
+            is_straight = elbow_angle >= ELBOW_THRESHOLD
+            is_forward = effective_depth > 40
+            is_consistent = direction_consistency > 0.5  # Movement in one direction
+            is_ballistic = trajectory_phase in ['ACCEL', 'PEAK']  # Accelerating or at peak
             
-            if is_fast and is_straight and is_forward and not in_cooldown:
-                # FORWARD PUNCH DETECTED!
+            # Enhanced hit detection: require more conditions for higher confidence
+            # Fast + Straight + Forward = basic hit
+            # + Consistent + Ballistic = confirmed punch
+            
+            basic_hit = is_fast and is_straight and is_forward
+            high_confidence = basic_hit and (is_consistent or is_ballistic)
+            
+            if high_confidence and not in_cooldown:
+                # HIGH CONFIDENCE PUNCH DETECTED!
                 results[hand]['hit'] = True
                 self.last_hit_frame[hand] = self.frame_count
                 self.hit_count[hand] += 1
@@ -540,17 +965,27 @@ if __name__ == "__main__":
                 elbow_color = (0, 255, 0) if is_straight else (0, 0, 255)
                 elbow_label = "STRAIGHT" if is_straight else "BENT"
                 
+                # Get quick win values
+                dir_cons = hit_results[hand].get('direction_consistency', 0)
+                traj_phase = hit_results[hand].get('trajectory_phase', 'IDLE')
+                ke = hit_results[hand].get('kinetic_energy', 0)
+                
+                # Phase color
+                phase_colors = {'ACCEL': (0, 255, 0), 'PEAK': (0, 255, 255), 'DECEL': (255, 165, 0), 'IDLE': (100, 100, 100)}
+                phase_color = phase_colors.get(traj_phase, (100, 100, 100))
+                
                 # Labels
                 cv2.putText(frame, f"{hand}", (bar_x, 440), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 cv2.putText(frame, f"D={depth_pct:.0f}%", (bar_x, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.5, depth_color, 2)
-                cv2.putText(frame, f"E={elbow:.0f}° {elbow_label}", (bar_x, 480), cv2.FONT_HERSHEY_SIMPLEX, 0.4, elbow_color, 1)
+                cv2.putText(frame, f"E={elbow:.0f}°", (bar_x, 478), cv2.FONT_HERSHEY_SIMPLEX, 0.4, elbow_color, 1)
+                cv2.putText(frame, f"{traj_phase}", (bar_x + 60, 478), cv2.FONT_HERSHEY_SIMPLEX, 0.4, phase_color, 1)
                 
                 # HIT indicator
                 if hit:
                     hit_x = 200 if hand == 'Left' else w - 300
                     cv2.putText(frame, ">>> PUNCH! <<<", (hit_x, 100), 
                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3)
-                    print(f">>> {hand} PUNCH! Depth={depth_pct:.0f}% (Total: {detector.hit_count[hand]})")
+                    print(f">>> {hand} PUNCH! D={depth_pct:.0f}% {traj_phase} KE={ke:.2f} (#{detector.hit_count[hand]})")
             
             # Stats overlay
             stats = detector.get_stats()
