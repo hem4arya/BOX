@@ -1,0 +1,95 @@
+# ============================================
+# Python Virtual Environment
+# ============================================
+venv/
+env/
+.env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+**/venv/
+**/env/
+**/site-packages/
+
+# ============================================
+# Python Bytecode & Cache
+# ============================================
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ============================================
+# YOLO & ML Models
+# ============================================
+*.pt
+*.pth
+*.onnx
+*.weights
+runs/
+weights/
+yolov*.pt
+
+# ============================================
+# IDE & Editor
+# ============================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ============================================
+# OS Generated
+# ============================================
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ============================================
+# Build & Distribution
+# ============================================
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+*.manifest
+*.spec
+
+# ============================================
+# Testing & Coverage
+# ============================================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# ============================================
+# Logs & Temp Files
+# ============================================
+*.log
+*.tmp
+*.temp
+logs/
+
+# ============================================
+# Node.js (for web app if any)
+# ============================================
+node_modules/
+**/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
