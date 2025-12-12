@@ -1,29 +1,109 @@
 """
-Skeleton-Based Hit Detector with Advanced Signal Processing
-============================================================
-PHYSICS-BASED detection using:
-1. MediaPipe Pose skeleton (shoulder → elbow → wrist)
-2. Anthropometric depth (Pythagoras: Z = sqrt(L² - P²))
-3. Elbow angle gating (bent arm = guard, straight = punch)
+Skeleton-Based Hit Detector with AI-Powered Punch Classification
+=================================================================
+NOW USES TRAINED 1D-CNN CLASSIFIER instead of manual thresholds!
 
-QUICK WINS:
-4. Direction consistency (dot product of velocity vectors)
-5. Kinetic energy profile (KE = 0.5 × v²)
-6. Trajectory phase detection (ACCEL → PEAK → DECEL → IDLE)
+The AI model runs on GPU and predicts punch type from temporal patterns:
+- Input: Last 30 frames of pose features
+- Output: JAB, CROSS, HOOK, UPPERCUT, or IDLE
+- Confidence threshold: 0.7 (70%)
 
-MEDIUM EFFORT:
-7. Lucas-Kanade optical flow for motion validation
-8. Kalman Filter for state estimation [x, y, vx, vy, ax, ay]
+OLD WAY: velocity > 0.35 AND depth > 40% AND is_accelerating AND ...
+NEW WAY: model.predict(last_30_frames) → punch_type with confidence
 
-HEAVY LIFT:
-9. LSTM/TCN Temporal Classifier for punch type detection
-10. Inverse Kinematics (IK) Solver for 3D arm reconstruction
+Features per frame (10 total):
+1-2: wrist_x, wrist_y
+3-4: elbow_x, elbow_y  
+5-6: shoulder_x, shoulder_y
+7: elbow_angle (degrees)
+8: velocity
+9-10: direction_x, direction_y
 """
 
 import numpy as np
 import cv2
 from collections import deque
 import time
+import torch
+import torch.nn as nn
+from pathlib import Path
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# AI CLASSIFIER: 1D-CNN for Punch Type Classification
+# ════════════════════════════════════════════════════════════════════════════
+class PunchClassifierCNN(nn.Module):
+    """
+    1D Convolutional Neural Network for punch classification.
+    Input: (batch, 30, 10) - 30 frames, 10 features per frame
+    Output: (batch, 5) - 5 punch classes
+    """
+    
+    def __init__(self, num_features=10, num_classes=5):
+        super(PunchClassifierCNN, self).__init__()
+        
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(num_features, 32, kernel_size=3, padding=1),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.MaxPool1d(2)
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(2)
+        )
+        
+        self.conv3 = nn.Sequential(
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1)
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, num_classes)
+        )
+    
+    def forward(self, x):
+        x = x.transpose(1, 2)  # (batch, 30, 10) -> (batch, 10, 30)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = x.squeeze(-1)
+        x = self.classifier(x)
+        return x
+
+
+def load_ai_classifier():
+    """Load trained punch classifier."""
+    model_path = Path(__file__).parent / 'punch_classifier.pth'
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    if not model_path.exists():
+        print(f"[AI] WARNING: Model not found at {model_path}")
+        print("[AI] Using heuristic detection instead")
+        return None, None, None
+    
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    model = PunchClassifierCNN().to(device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    
+    class_names = checkpoint.get('class_names', ['jab', 'cross', 'hook', 'uppercut', 'idle'])
+    
+    print(f"[AI] ✓ Punch classifier loaded on {device}")
+    print(f"[AI] Classes: {list(class_names)}")
+    
+    return model, class_names, device
+
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -584,6 +664,25 @@ class SkeletonHitDetector:
         self.last_anthropometric_depth = {'Left': 0, 'Right': 0}
         
         # ════════════════════════════════════════════════════════════════
+        # AI CLASSIFIER: Replace heuristics with trained model
+        # ════════════════════════════════════════════════════════════════
+        
+        # Load trained AI model (will be None if model file not found)
+        self.ai_model, self.ai_class_names, self.ai_device = load_ai_classifier()
+        self.use_ai = self.ai_model is not None
+        
+        # Feature buffer for AI (30 frames × 10 features)
+        self.ai_feature_buffer = {
+            'Left': deque(maxlen=30),
+            'Right': deque(maxlen=30)
+        }
+        
+        # AI prediction results
+        self.ai_punch_type = {'Left': 'idle', 'Right': 'idle'}
+        self.ai_confidence = {'Left': 0.0, 'Right': 0.0}
+        self.AI_CONFIDENCE_THRESHOLD = 0.5  # Lowered from 0.7 for better detection
+        
+        # ════════════════════════════════════════════════════════════════
         # QUICK WINS: Advanced Signal Processing
         # ════════════════════════════════════════════════════════════════
         
@@ -930,6 +1029,85 @@ class SkeletonHitDetector:
         is_sufficient = self.distance_traveled[hand] > self.MIN_DISTANCE_TRAVELED
         return self.distance_traveled[hand], is_sufficient
     
+    # ════════════════════════════════════════════════════════════════════════
+    # AI CLASSIFICATION: Replace heuristics with trained model
+    # ════════════════════════════════════════════════════════════════════════
+    
+    def extract_ai_features(self, pose_landmarks, hand, velocity, velocity_vector):
+        """
+        Extract 10 features per frame for AI classifier.
+        
+        Features:
+        1-2: wrist_x, wrist_y (normalized 0-1)
+        3-4: elbow_x, elbow_y
+        5-6: shoulder_x, shoulder_y
+        7: elbow_angle (degrees / 180 for normalization)
+        8: velocity (already normalized)
+        9-10: direction_x, direction_y
+        """
+        if hand == 'Left':
+            wrist = pose_landmarks.landmark[self.WRIST_LEFT]
+            elbow = pose_landmarks.landmark[self.ELBOW_LEFT]
+            shoulder = pose_landmarks.landmark[self.SHOULDER_LEFT]
+        else:
+            wrist = pose_landmarks.landmark[self.WRIST_RIGHT]
+            elbow = pose_landmarks.landmark[self.ELBOW_RIGHT]
+            shoulder = pose_landmarks.landmark[self.SHOULDER_RIGHT]
+        
+        # Calculate elbow angle
+        _, elbow_angle, _ = self._get_arm_geometry(pose_landmarks, hand)
+        
+        # Direction from velocity vector
+        vel_mag = np.linalg.norm(velocity_vector)
+        if vel_mag > 0.001:
+            dx = velocity_vector[0] / vel_mag
+            dy = velocity_vector[1] / vel_mag
+        else:
+            dx, dy = 0.0, 0.0
+        
+        features = [
+            wrist.x, wrist.y,
+            elbow.x, elbow.y,
+            shoulder.x, shoulder.y,
+            elbow_angle / 180.0,  # Normalize to 0-1
+            min(velocity * 2, 1.0),  # Scale velocity
+            dx, dy
+        ]
+        
+        return features
+    
+    def ai_predict_punch(self, hand):
+        """
+        Run AI classifier on last 30 frames.
+        
+        Returns:
+            punch_type: 'jab', 'cross', 'hook', 'uppercut', or 'idle'
+            confidence: 0.0 - 1.0
+        """
+        if not self.use_ai:
+            return 'idle', 0.0
+        
+        buffer = self.ai_feature_buffer[hand]
+        if len(buffer) < 30:
+            return 'idle', 0.0
+        
+        # Convert to tensor
+        X = torch.FloatTensor(list(buffer)).unsqueeze(0).to(self.ai_device)
+        
+        with torch.no_grad():
+            outputs = self.ai_model(X)
+            probs = torch.softmax(outputs, dim=1)
+            confidence, predicted = torch.max(probs, 1)
+        
+        punch_type = self.ai_class_names[predicted.item()]
+        conf = confidence.item()
+        
+        # Store results
+        self.ai_punch_type[hand] = punch_type
+        self.ai_confidence[hand] = conf
+        
+        return punch_type, conf
+    
     def _get_arm_geometry(self, pose_landmarks, hand):
         """
         Calculate full arm geometry using shoulder-elbow-wrist skeleton.
@@ -1155,11 +1333,10 @@ class SkeletonHitDetector:
             self.kalman_accel[hand] = kalman_accel
             
             # ════════════════════════════════════════════════════════════
-            # FIX: 5-FRAME VELOCITY CALCULATION (filters out jitter)
+            # FIX: 3-FRAME VELOCITY CALCULATION (faster response)
             # ════════════════════════════════════════════════════════════
-            # Instead of frame-to-frame (noisy), measure distance over 5 frames
-            VELOCITY_FRAMES = 5
-            DEAD_ZONE = 0.04  # Below this = treated as 0
+            VELOCITY_FRAMES = 3  # Reduced from 5 for faster response
+            DEAD_ZONE = 0.02  # Lowered from 0.04 for more sensitivity
             
             if len(self.position_history[hand]) >= VELOCITY_FRAMES + 1:
                 # Distance from 5 frames ago to now
@@ -1261,61 +1438,60 @@ class SkeletonHitDetector:
             results[hand]['punch_confidence'] = punch_conf
             
             # ════════════════════════════════════════════════════════════
-            # FIX: SUSTAINED VELOCITY HIT DETECTION
+            # AI-POWERED HIT DETECTION (Replaces all heuristics!)
             # ════════════════════════════════════════════════════════════
-            # Problem: Instant velocity triggers on twitches/adjustments
-            # Solution: Require SUSTAINED velocity + acceleration + distance
+            # OLD: velocity > threshold AND depth > 40% AND is_accelerating...
+            # NEW: model.predict(last_30_frames) → punch_type with confidence
             
-            # Calculate sustained velocity metrics
-            sustained_vel, is_sustained = self.calculate_sustained_velocity(velocity, hand)
-            is_accelerating = self.check_acceleration_trend(velocity, hand)
-            distance, has_distance = self.update_distance_traveled(velocity, hand)
+            # Extract features for AI buffer
+            if len(self.position_history[hand]) >= 2:
+                features = self.extract_ai_features(
+                    pose_landmarks, hand, velocity, velocity_vector
+                )
+                self.ai_feature_buffer[hand].append(features)
             
             in_cooldown = (self.frame_count - self.last_hit_frame[hand]) < self.cooldown_frames
             
-            # Core punch requirements
-            is_fast = sustained_vel > self.velocity_threshold  # Use sustained, not instant!
+            # Run AI classification
+            ai_punch_type, ai_confidence = self.ai_predict_punch(hand)
+            
+            # Store AI results for display
+            results[hand]['ai_punch_type'] = ai_punch_type
+            results[hand]['ai_confidence'] = ai_confidence
+            
+            # ═══════════════════════════════════════════════════════════════
+            # HYBRID HIT DETECTION: AI first, then velocity fallback
+            # ═══════════════════════════════════════════════════════════════
+            # Method 1: AI predicts punch with confidence > 50%
+            # Method 2: Fallback to velocity threshold if AI not confident
+            
+            is_punch = ai_punch_type in ['jab', 'cross', 'hook', 'uppercut']
+            is_confident = ai_confidence > self.AI_CONFIDENCE_THRESHOLD
+            
+            # Fallback: High velocity + straight arm + forward depth
+            ELBOW_THRESHOLD = 130
+            is_fast = velocity > 0.08  # Lower threshold for sensitivity
             is_straight = elbow_angle >= ELBOW_THRESHOLD
-            is_forward = effective_depth > 40
-            is_consistent = direction_consistency > 0.5
-            is_ballistic = trajectory_phase in ['ACCEL', 'PEAK']
+            is_forward = effective_depth > 30  # Lower threshold
+            velocity_fallback = is_fast and is_straight and is_forward
             
-            # ═══════════════════════════════════════════════════════════════
-            # STRICT HIT DETECTION (v2): Require MULTIPLE quality checks!
-            # ═══════════════════════════════════════════════════════════════
-            # Problem: OR logic too permissive - any one quality check passes
-            # Solution: Require AT LEAST 2 out of 3 quality checks!
+            # Determine punch type from AI or use generic
+            if is_punch and is_confident:
+                detected_type = ai_punch_type.upper()
+            elif velocity_fallback:
+                # Use rule-based classification as fallback
+                detected_type = punch_type if punch_type != 'NO_PUNCH' else 'PUNCH'
+            else:
+                detected_type = None
             
-            core_requirements = is_fast and is_straight and is_forward
-            
-            # Count how many quality checks pass
-            quality_score = 0
-            if is_sustained:  # Must have sustained velocity for 3+ frames
-                quality_score += 1
-            if is_accelerating:  # Must be accelerating
-                quality_score += 1
-            if has_distance:  # Must have traveled sufficient distance
-                quality_score += 1
-            if is_consistent:  # Consistent direction
-                quality_score += 1
-            
-            # Require AT LEAST 2 quality checks to pass (was: any 1)
-            quality_check = quality_score >= 2
-            
-            # ADDITIONAL FIX: Require a classified punch type (not NO_PUNCH)
-            has_punch_type = punch_type != 'NO_PUNCH'
-            
-            valid_punch = core_requirements and quality_check and has_punch_type
-            
-            if valid_punch and not in_cooldown:
-                # HIGH CONFIDENCE PUNCH DETECTED!
+            if detected_type and not in_cooldown:
+                # PUNCH DETECTED!
                 results[hand]['hit'] = True
+                results[hand]['punch_type'] = detected_type
                 self.last_hit_frame[hand] = self.frame_count
                 self.hit_count[hand] += 1
-                # Reset distance after hit
-                self.distance_traveled[hand] = 0
-                # Reset velocity buffer to require build-up for next punch
-                self.velocity_buffer[hand].clear()
+                # Clear AI buffer for next punch
+                self.ai_feature_buffer[hand].clear()
         
         return results
     
@@ -1382,6 +1558,35 @@ if __name__ == "__main__":
     # Calibration countdown timer
     calibration_countdown = 0  # Seconds remaining (0 = not counting)
     calibration_start_time = 0
+    calibration_flash = 0  # Frames to show "CALIBRATED!" message
+    
+    # ════════════════════════════════════════════════════════════════
+    # GAME EFFECTS: Visual polish to make punches feel impactful
+    # ════════════════════════════════════════════════════════════════
+    
+    # Hit flash effect
+    hit_flash_timer = 0
+    HIT_FLASH_DURATION = 12  # frames
+    last_punch_type = 'jab'
+    last_punch_hand = 'Right'
+    
+    # Punch type colors
+    PUNCH_COLORS = {
+        'jab': (0, 255, 255),      # Yellow
+        'cross': (0, 0, 255),      # Red
+        'hook': (0, 255, 0),       # Green
+        'uppercut': (255, 0, 255), # Magenta
+        'punch': (255, 165, 0),    # Orange (fallback)
+    }
+    
+    # Combo counter
+    combo_count = 0
+    combo_timer = 0
+    COMBO_TIMEOUT = 45  # frames (~1.5 seconds at 30 FPS)
+    
+    # Score tracking
+    total_score = 0
+    PUNCH_SCORES = {'jab': 10, 'cross': 15, 'hook': 20, 'uppercut': 25, 'punch': 10}
     
     while True:
         ret, frame = cap.read()
@@ -1397,6 +1602,7 @@ if __name__ == "__main__":
         
         # Mirror the frame for natural interaction
         frame = cv2.flip(frame, 1)
+        h, w = frame.shape[:2]  # Get dimensions for game effects
         
         # Process with MediaPipe
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1494,13 +1700,27 @@ if __name__ == "__main__":
                 if punch_type != 'NO_PUNCH':
                     cv2.putText(frame, f"{punch_type}", (bar_x, 498), cv2.FONT_HERSHEY_SIMPLEX, 0.5, punch_color, 2)
                 
-                # HIT indicator with punch type
+                # HIT indicator with punch type + GAME EFFECTS
                 if hit:
-                    hit_x = 200 if hand == 'Left' else w - 300
-                    label = f">>> {punch_type}! <<<" if punch_type != 'NO_PUNCH' else ">>> PUNCH! <<<"
-                    cv2.putText(frame, label, (hit_x, 100), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1.5, punch_color, 3)
-                    print(f">>> {hand} {punch_type}! D={depth_pct:.0f}% IK={ik_depth:.0f}% {traj_phase} (#{detector.hit_count[hand]})")
+                    # ════════════════════════════════════════════════
+                    # TRIGGER GAME EFFECTS ON HIT
+                    # ════════════════════════════════════════════════
+                    hit_flash_timer = HIT_FLASH_DURATION
+                    last_punch_type = punch_type.lower() if punch_type != 'NO_PUNCH' else 'punch'
+                    last_punch_hand = hand
+                    
+                    # Update combo
+                    combo_count += 1
+                    combo_timer = COMBO_TIMEOUT
+                    
+                    # Add score
+                    base_score = PUNCH_SCORES.get(last_punch_type, 10)
+                    combo_bonus = (combo_count - 1) * 5 if combo_count > 1 else 0
+                    total_score += base_score + combo_bonus
+                    
+                    # Print hit info
+                    combo_text = f" (COMBO x{combo_count}!)" if combo_count > 1 else ""
+                    print(f">>> {hand} {punch_type}! D={depth_pct:.0f}% +{base_score+combo_bonus}pts{combo_text}")
             
             # Stats overlay
             stats = detector.get_stats()
@@ -1519,6 +1739,54 @@ if __name__ == "__main__":
         fps_color = (0, 255, 0) if current_fps >= 25 else (0, 165, 255) if current_fps >= 15 else (0, 0, 255)
         cv2.putText(frame, f"FPS: {current_fps:.0f}", (10, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, fps_color, 2)
+        
+        # ════════════════════════════════════════════════════════════════
+        # GAME EFFECTS RENDERING
+        # ════════════════════════════════════════════════════════════════
+        
+        # Update combo timer
+        if combo_timer > 0:
+            combo_timer -= 1
+        else:
+            combo_count = 0  # Reset combo on timeout
+        
+        # 1. HIT FLASH EFFECT
+        if hit_flash_timer > 0:
+            flash_intensity = hit_flash_timer / HIT_FLASH_DURATION
+            overlay = frame.copy()
+            flash_color = PUNCH_COLORS.get(last_punch_type, (255, 165, 0))
+            cv2.rectangle(overlay, (0, 0), (w, h), flash_color, -1)
+            frame = cv2.addWeighted(overlay, flash_intensity * 0.25, frame, 1, 0)
+            
+            # 2. PUNCH TYPE POPUP (shrinking animation)
+            text = last_punch_type.upper() + "!"
+            font_scale = 2.0 + (hit_flash_timer / HIT_FLASH_DURATION) * 1.5
+            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 4)[0]
+            text_x = (w - text_size[0]) // 2
+            text_y = h // 2
+            
+            # Shadow
+            cv2.putText(frame, text, (text_x + 3, text_y + 3), 
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), 6)
+            # Main text
+            cv2.putText(frame, text, (text_x, text_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, flash_color, 4)
+            
+            hit_flash_timer -= 1
+        
+        # 3. COMBO COUNTER
+        if combo_count >= 2:
+            combo_color = (0, 255, 255) if combo_count < 5 else (0, 165, 255) if combo_count < 10 else (0, 0, 255)
+            cv2.putText(frame, f"COMBO x{combo_count}", (20, 80), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 4)
+            cv2.putText(frame, f"COMBO x{combo_count}", (18, 78), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, combo_color, 3)
+        
+        # 4. SCORE DISPLAY
+        cv2.putText(frame, f"SCORE: {total_score}", (w - 180, 40), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3)
+        cv2.putText(frame, f"SCORE: {total_score}", (w - 182, 38), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         # ════════════════════════════════════════════════════════════
         # CALIBRATION COUNTDOWN DISPLAY
         # ════════════════════════════════════════════════════════════
@@ -1536,7 +1804,14 @@ if __name__ == "__main__":
                 # Countdown finished - CALIBRATE NOW!
                 if results.pose_landmarks:
                     detector.calibrate_arm_length(results.pose_landmarks)
+                    calibration_flash = 60  # Show "CALIBRATED!" for 60 frames
                 calibration_countdown = 0
+        
+        # Show calibration flash
+        if calibration_flash > 0:
+            cv2.putText(frame, "CALIBRATED!", (w//2 - 120, 120), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+            calibration_flash -= 1
         
         # Show frame
         cv2.imshow("Skeleton Hit Detector", frame)
