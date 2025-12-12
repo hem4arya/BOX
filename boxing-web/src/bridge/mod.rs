@@ -4,6 +4,7 @@
 //! Re-exports only in mod.rs, logic in submodules.
 
 mod landmarks;
+mod classifier_integration;
 
 pub use landmarks::{
     // WASM entry points
@@ -20,4 +21,13 @@ pub use landmarks::{
     LEFT_ELBOW, RIGHT_ELBOW,
     LEFT_WRIST, RIGHT_WRIST,
     ARM_SKELETON, KEY_LANDMARKS,
+};
+
+pub use classifier_integration::{
+    init_classifier, 
+    set_classifier_ready,
+    get_classification_buffer,
+    is_buffer_ready,
+    get_last_punch, 
+    is_classifier_ready
 };

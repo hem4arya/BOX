@@ -190,6 +190,17 @@ pub fn update_landmarks(data: &[f32]) {
         // Store predicted positions
         state.predicted_wrists[0] = state.left_hand.kalman.position();
         state.predicted_wrists[1] = state.right_hand.kalman.position();
+        
+        // Get velocity magnitudes for classification
+        let left_vel = state.left_hand.velocity.update((left_wrist.x, left_wrist.y));
+        let right_vel = state.right_hand.velocity.update((right_wrist.x, right_wrist.y));
+        
+        // Run classification (if model is loaded)
+        super::classifier_integration::process_classification_frame(
+            &state.raw_landmarks,
+            left_vel,
+            right_vel,
+        );
     });
 }
 
