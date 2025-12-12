@@ -93,3 +93,15 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+
+# ============================================
+# Rust & WASM
+# ============================================
+target/
+**/target/
+Cargo.lock
+**/*.rs.bk
+
+# WASM build output (wasm-pack)
+pkg/
+**/pkg/

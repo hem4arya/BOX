@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Boxing Web</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        background: #0f0f23;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        min-height: 100vh;
+        font-family: system-ui, sans-serif;
+      }
+      .container {
+        position: relative;
+      }
+      #game-canvas {
+        width: 800px;
+        height: 600px;
+        border-radius: 8px;
+        box-shadow: 0 0 40px rgba(0, 100, 255, 0.3);
+      }
+      #camera-video {
+        display: none;
+      }
+      #error-msg {
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        background: #ff4444;
+        color: white;
+        padding: 24px 48px;
+        border-radius: 12px;
+        font-size: 18px;
+        display: none;
+        z-index: 100;
+      }
+      #status {
+        position: fixed;
+        top: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        color: #888;
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="status">Initializing...</div>
+    <div class="container">
+      <canvas id="game-canvas"></canvas>
+      <video id="camera-video" autoplay playsinline></video>
+    </div>
+    <div id="error-msg">
+      WebGPU not supported. Please use Chrome 113+ or Edge 113+.
+    </div>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest"
+        }
+      }
+    </script>
+    <script type="module" src="main.js"></script>
+  </body>
+</html>
