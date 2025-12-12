@@ -10,10 +10,16 @@ import init, {
   init as wasmInit,
   update_landmarks,
   render_frame,
+  physics_tick,
+  calibrate_depth,
 } from "../pkg/boxing_web.js";
 
 const status = document.getElementById("status");
 const video = document.getElementById("camera-video");
+
+// Physics timing
+const PHYSICS_DT = 1.0 / 120.0; // 120Hz physics
+let lastPhysicsTime = 0;
 
 async function main() {
   status.textContent = "Loading WASM...";
@@ -63,65 +69,79 @@ async function main() {
   });
 
   console.log("🤖 MediaPipe Pose Landmarker ready");
-  status.textContent = "✅ Ready - Move your arms!";
+  status.textContent = "✅ Ready - Press C to calibrate (T-pose)";
+
+  // Keyboard handler for calibration
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "c" || e.key === "C") {
+      calibrate_depth();
+      status.textContent =
+        "✅ Calibrated! Move your arms fast to see prediction.";
+    }
+  });
 
   // 4. Detection + Render loop
-  let lastTime = 0;
+  let lastDetectionTime = 0;
   let frameCount = 0;
 
-  function detectFrame(timestamp) {
-    // Throttle to ~30fps for detection (MediaPipe is heavy)
-    if (timestamp - lastTime < 33) {
-      requestAnimationFrame(detectFrame);
-      return;
+  function gameLoop(timestamp) {
+    // Physics tick at ~120Hz
+    const physicsElapsed = timestamp - lastPhysicsTime;
+    if (physicsElapsed >= 8) {
+      // ~120fps
+      physics_tick(physicsElapsed / 1000.0);
+      lastPhysicsTime = timestamp;
     }
-    lastTime = timestamp;
 
-    // Run pose detection
-    const results = poseLandmarker.detectForVideo(video, timestamp);
+    // MediaPipe detection at ~30Hz
+    const detectionElapsed = timestamp - lastDetectionTime;
+    if (detectionElapsed >= 33) {
+      // ~30fps
+      lastDetectionTime = timestamp;
 
-    if (results.landmarks && results.landmarks[0]) {
-      // Convert to flat Float32Array for Rust (33 landmarks * 3 coords = 99 floats)
-      const landmarks = results.landmarks[0];
-      const flatArray = new Float32Array(landmarks.length * 3);
+      const results = poseLandmarker.detectForVideo(video, timestamp);
 
-      landmarks.forEach((lm, i) => {
-        flatArray[i * 3] = lm.x; // 0-1 normalized X
-        flatArray[i * 3 + 1] = lm.y; // 0-1 normalized Y
-        flatArray[i * 3 + 2] = lm.z; // Relative depth
-      });
+      if (results.landmarks && results.landmarks[0]) {
+        const landmarks = results.landmarks[0];
+        const flatArray = new Float32Array(landmarks.length * 3);
 
-      // Send landmarks to Rust
-      update_landmarks(flatArray);
+        landmarks.forEach((lm, i) => {
+          flatArray[i * 3] = lm.x;
+          flatArray[i * 3 + 1] = lm.y;
+          flatArray[i * 3 + 2] = lm.z;
+        });
 
-      // Debug: log every 60 frames
-      frameCount++;
-      if (frameCount % 60 === 0) {
-        const rightWrist = landmarks[16];
-        console.log(
-          `🎯 Right wrist: (${rightWrist.x.toFixed(2)}, ${rightWrist.y.toFixed(
-            2
-          )})`
-        );
+        // Send to Rust (triggers Kalman UPDATE at 30Hz)
+        update_landmarks(flatArray);
+
+        // Debug log every 2 seconds
+        frameCount++;
+        if (frameCount % 60 === 0) {
+          const rightWrist = landmarks[16];
+          console.log(
+            `🎯 Wrist: (${rightWrist.x.toFixed(2)}, ${rightWrist.y.toFixed(2)})`
+          );
+        }
       }
     }
 
-    // Render frame with current landmarks
+    // Render every frame
     render_frame();
 
-    requestAnimationFrame(detectFrame);
+    requestAnimationFrame(gameLoop);
   }
 
-  // Start detection when video is ready
+  // Start game loop
   video.addEventListener("loadeddata", () => {
-    console.log("🎬 Video ready, starting detection loop");
-    requestAnimationFrame(detectFrame);
+    console.log("🎬 Starting game loop");
+    lastPhysicsTime = performance.now();
+    requestAnimationFrame(gameLoop);
   });
 
-  // If video already loaded
   if (video.readyState >= 2) {
     console.log("🎬 Video already ready");
-    requestAnimationFrame(detectFrame);
+    lastPhysicsTime = performance.now();
+    requestAnimationFrame(gameLoop);
   }
 }
 

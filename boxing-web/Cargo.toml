@@ -20,6 +20,7 @@ web-sys = { version = "0.3", features = [
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
 bytemuck = { version = "1.14", features = ["derive"] }
+nalgebra = "0.33"
 
 [profile.release]
 opt-level = "z"

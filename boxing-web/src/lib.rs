@@ -5,12 +5,13 @@
 //! - wasm_bindgen entry points that delegate to submodules
 
 mod bridge;
+mod physics;
 mod renderer;
 
 use wasm_bindgen::prelude::*;
 
 // Re-export wasm_bindgen functions for JS access
-pub use bridge::update_landmarks;
+pub use bridge::{update_landmarks, physics_tick, calibrate_depth};
 
 // ============================================================================
 // CONSOLE LOGGING

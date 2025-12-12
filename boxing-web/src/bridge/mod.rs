@@ -6,10 +6,16 @@
 mod landmarks;
 
 pub use landmarks::{
+    // WASM entry points
     update_landmarks, 
+    physics_tick,
+    calibrate_depth,
+    // Internal API
     get_all_landmarks, 
+    get_predicted_wrists,
+    get_debug_info,
     Landmark,
-    // Constants for landmark indices
+    // Constants
     NOSE, LEFT_SHOULDER, RIGHT_SHOULDER,
     LEFT_ELBOW, RIGHT_ELBOW,
     LEFT_WRIST, RIGHT_WRIST,
