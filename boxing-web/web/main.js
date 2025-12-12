@@ -17,30 +17,57 @@ import init, {
   get_classification_buffer,
   is_buffer_ready,
   set_punch_result,
+  set_frame_metrics,
+  set_mediapipe_latency,
+  set_onnx_latency,
+  set_physics_time,
+  get_debug_overlay_text,
 } from "../pkg/boxing_web.js";
 
 const status = document.getElementById("status");
 const video = document.getElementById("camera-video");
+const debugOverlay = document.getElementById("debug-overlay");
 
-// Physics timing
+// Timing
 let lastPhysicsTime = 0;
+let lastFrameTime = 0;
+let fps = 0;
+let frameCount = 0;
+let lastFpsUpdate = 0;
 
-// ONNX model session
+// ONNX model
 let onnxSession = null;
-
-// Punch detection state
 const CONFIDENCE_THRESHOLD = 0.5;
 const PUNCH_NAMES = ["JAB", "CROSS", "HOOK", "UPPERCUT", "IDLE"];
 
+// Calibration
+let calibrationCountdown = 0;
+let calibrationInterval = null;
+
+function startCalibrationCountdown() {
+  if (calibrationInterval) return;
+  calibrationCountdown = 5;
+  status.textContent = `📐 T-POSE in ${calibrationCountdown}...`;
+  calibrationInterval = setInterval(() => {
+    calibrationCountdown--;
+    if (calibrationCountdown > 0) {
+      status.textContent = `📐 T-POSE in ${calibrationCountdown}...`;
+    } else {
+      clearInterval(calibrationInterval);
+      calibrationInterval = null;
+      calibrate_depth();
+      status.textContent = "✅ Calibrated! Punch to detect.";
+    }
+  }, 1000);
+}
+
 async function main() {
   status.textContent = "Loading WASM...";
-
-  // Initialize WASM module
   await init();
   await wasmInit();
   console.log("🥊 Boxing Web WASM loaded");
 
-  // Try to load ONNX model
+  // Load ONNX model
   status.textContent = "Loading ML model...";
   try {
     ort.env.wasm.wasmPaths =
@@ -49,18 +76,12 @@ async function main() {
       "/assets/punch_classifier.onnx"
     );
     set_classifier_ready();
-    console.log("🧠 Punch classifier loaded via onnxruntime-web");
+    console.log("🧠 Punch classifier loaded");
   } catch (err) {
     console.warn("⚠️ Could not load classifier:", err.message);
-    console.warn(
-      "   Run: python convert_to_onnx.py in the boxing-web directory"
-    );
-    console.warn("   Then copy punch_classifier.onnx to assets/");
   }
 
   status.textContent = "Requesting camera...";
-
-  // 2. Get camera stream
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -72,17 +93,13 @@ async function main() {
     });
   } catch (err) {
     status.textContent = "❌ Camera access denied";
-    console.error("Camera error:", err);
     return;
   }
 
   video.srcObject = stream;
   await video.play();
-  console.log("📹 Camera started");
 
   status.textContent = "Loading MediaPipe...";
-
-  // 3. Initialize MediaPipe Pose Landmarker
   const vision = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
   );
@@ -97,48 +114,39 @@ async function main() {
     numPoses: 1,
   });
 
-  console.log("🤖 MediaPipe Pose Landmarker ready");
-  status.textContent = "✅ Ready - Press C to calibrate (T-pose)";
+  console.log("🤖 MediaPipe ready");
+  status.textContent = "✅ Ready - Press C to calibrate";
 
-  // Keyboard handler for calibration
   document.addEventListener("keydown", (e) => {
-    if (e.key === "c" || e.key === "C") {
-      calibrate_depth();
-      status.textContent = "✅ Calibrated! Punch to detect.";
-    }
+    if (e.key === "c" || e.key === "C") startCalibrationCountdown();
   });
 
-  // 4. Detection + Render loop
   let lastDetectionTime = 0;
-  let frameCount = 0;
   let lastClassifyTime = 0;
 
   async function runClassification() {
     if (!onnxSession || !is_buffer_ready()) return;
-
-    // Only classify every 100ms (10Hz) to avoid overload
     const now = performance.now();
     if (now - lastClassifyTime < 100) return;
     lastClassifyTime = now;
 
     try {
+      const onnxStart = performance.now();
       const bufferData = get_classification_buffer();
       if (!bufferData) return;
 
-      // Create input tensor: (1, 30, 10)
       const inputTensor = new ort.Tensor("float32", bufferData, [1, 30, 10]);
-
-      // Run inference
       const results = await onnxSession.run({ input: inputTensor });
       const output = results.output.data;
 
-      // Softmax + argmax
+      set_onnx_latency(performance.now() - onnxStart);
+
       const maxLogit = Math.max(...output);
       const expSum = output.reduce((sum, x) => sum + Math.exp(x - maxLogit), 0);
       const probs = output.map((x) => Math.exp(x - maxLogit) / expSum);
 
-      let maxIdx = 0;
-      let maxProb = probs[0];
+      let maxIdx = 0,
+        maxProb = probs[0];
       for (let i = 1; i < probs.length; i++) {
         if (probs[i] > maxProb) {
           maxIdx = i;
@@ -146,10 +154,7 @@ async function main() {
         }
       }
 
-      // Send result to Rust
       set_punch_result(maxIdx, maxProb);
-
-      // Log punch detection
       if (maxProb > CONFIDENCE_THRESHOLD && maxIdx < 4) {
         console.log(
           `🥊 ${PUNCH_NAMES[maxIdx]} (${(maxProb * 100).toFixed(0)}%)`
@@ -161,56 +166,67 @@ async function main() {
   }
 
   function gameLoop(timestamp) {
-    // Physics tick at ~120Hz
+    // FPS calculation
+    const frameTime = timestamp - lastFrameTime;
+    lastFrameTime = timestamp;
+    frameCount++;
+
+    if (timestamp - lastFpsUpdate >= 500) {
+      fps = (frameCount * 1000) / (timestamp - lastFpsUpdate);
+      set_frame_metrics(fps, frameTime);
+      frameCount = 0;
+      lastFpsUpdate = timestamp;
+
+      // Update debug overlay every 500ms
+      debugOverlay.textContent = get_debug_overlay_text();
+    }
+
+    // Physics tick ~120Hz
     const physicsElapsed = timestamp - lastPhysicsTime;
     if (physicsElapsed >= 8) {
+      const physicsStart = performance.now();
       physics_tick(physicsElapsed / 1000.0);
+      set_physics_time(performance.now() - physicsStart);
       lastPhysicsTime = timestamp;
     }
 
-    // MediaPipe detection at ~30Hz
+    // MediaPipe ~30Hz
     const detectionElapsed = timestamp - lastDetectionTime;
     if (detectionElapsed >= 33) {
       lastDetectionTime = timestamp;
 
+      const mpStart = performance.now();
       const results = poseLandmarker.detectForVideo(video, timestamp);
+      set_mediapipe_latency(performance.now() - mpStart);
 
       if (results.landmarks && results.landmarks[0]) {
         const landmarks = results.landmarks[0];
         const flatArray = new Float32Array(landmarks.length * 3);
-
         landmarks.forEach((lm, i) => {
           flatArray[i * 3] = lm.x;
           flatArray[i * 3 + 1] = lm.y;
           flatArray[i * 3 + 2] = lm.z;
         });
-
-        // Send to Rust (triggers Kalman UPDATE + Feature extraction)
         update_landmarks(flatArray);
-
-        // Run classification (async)
         runClassification();
-
-        frameCount++;
       }
     }
 
-    // Render every frame
     render_frame();
-
     requestAnimationFrame(gameLoop);
   }
 
-  // Start game loop
   video.addEventListener("loadeddata", () => {
-    console.log("🎬 Starting game loop");
     lastPhysicsTime = performance.now();
+    lastFrameTime = performance.now();
+    lastFpsUpdate = performance.now();
     requestAnimationFrame(gameLoop);
   });
 
   if (video.readyState >= 2) {
-    console.log("🎬 Video already ready");
     lastPhysicsTime = performance.now();
+    lastFrameTime = performance.now();
+    lastFpsUpdate = performance.now();
     requestAnimationFrame(gameLoop);
   }
 }

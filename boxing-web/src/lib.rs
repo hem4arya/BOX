@@ -22,6 +22,10 @@ pub use bridge::{
     is_buffer_ready,
 };
 pub use classifier::set_punch_result;
+pub use renderer::{
+    set_frame_metrics, set_mediapipe_latency, set_onnx_latency,
+    set_physics_time, get_debug_overlay_text,
+};
 
 // ============================================================================
 // CONSOLE LOGGING

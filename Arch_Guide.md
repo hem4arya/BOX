@@ -1,9 +1,14 @@
 1. FILE SIZE LIMITS
-   Rule Limit
-   Max lines per .rs file 300 lines
-   Max lines per function 50 lines
-   Max items exported from mod.rs 10 items
-   If a file exceeds 300 lines → split into sub-modules.
+
+| File Type                              | Max Lines | Max Function Lines | Reasoning                   |
+| -------------------------------------- | --------- | ------------------ | --------------------------- |
+| Math/Physics (`kalman.rs`, `depth.rs`) | 200       | 50                 | Pure math, highly focused   |
+| Game Loop (`engine.rs`, `lib.rs`)      | 300       | 100                | Complex orchestration logic |
+| Renderer (`skeleton.rs`, `effects.rs`) | 250       | 80                 | GPU pipeline setup          |
+| Bridge (`landmarks.rs`)                | 150       | 40                 | Simple data passing         |
+
+Max items exported from mod.rs: 10 items
+If a file exceeds its limit → split into sub-modules.
 
 2. MODULE STRUCTURE
    src/

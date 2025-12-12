@@ -14,7 +14,9 @@ pub use landmarks::{
     // Internal API
     get_all_landmarks, 
     get_predicted_wrists,
+    get_smoothed_wrists,
     get_debug_info,
+    get_depth_validity,
     Landmark,
     // Constants
     NOSE, LEFT_SHOULDER, RIGHT_SHOULDER,
