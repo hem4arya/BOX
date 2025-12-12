@@ -1,15 +1,16 @@
 """
-Master Vision System for Boxing Game (v2)
-==========================================
+Master Vision System for Boxing Game (v2.1 + LSTM)
+===================================================
 Unified interface that combines all tracking and detection components.
 
-CHANGES IN V2:
+CHANGES IN V2.1:
+- Added LSTM Predictive Tracking (Layer 2 in fallback hierarchy)
 - Uses POSE wrist landmarks (15, 16) instead of HAND landmarks for more stable tracking
 - Adds arm velocity calculation using full kinematic chain (shoulder → elbow → wrist)
 - Hands detector only used for gesture detection (fist/open)
 
 Architecture:
-  Camera → Pose Detection → Arm Velocity → DepthEstimator → FlowValidator → PunchFSM → Events
+  Camera → Pose Detection → Arm Velocity → DepthEstimator → LSTM+FlowValidator → PunchFSM → Events
 
 Usage:
     vision = MasterVisionSystem()
@@ -39,12 +40,21 @@ from depth_estimator import AnchorDepthEstimator
 from flow_gated_validator import FlowGatedValidator, TRACKING_COLORS
 from punch_fsm import PunchDetector, PunchState, STATE_COLORS
 
+# Phase 2: LSTM Predictive Tracking
+try:
+    from lstm_predictor import PredictiveTracker
+    LSTM_AVAILABLE = True
+except ImportError:
+    LSTM_AVAILABLE = False
+    print("Warning: LSTM predictor not available")
+
 
 class MasterVisionSystem:
     """
     Unified boxing vision system combining all components.
     
-    V2 Changes:
+    V2.1 Changes:
+    - LSTM Predictive Tracking for occlusion bridging
     - Position tracking uses POSE wrist (more stable during occlusion)
     - Arm velocity calculated from full kinematic chain
     - Hand landmarks only for gesture detection
@@ -64,7 +74,8 @@ class MasterVisionSystem:
                  camera_id=0,
                  resolution=(640, 480),
                  model_complexity=1,
-                 use_hands_for_gesture=True):
+                 use_hands_for_gesture=True,
+                 enable_lstm=True):
         """
         Initialize all components.
         
@@ -73,6 +84,7 @@ class MasterVisionSystem:
             resolution: (width, height)
             model_complexity: MediaPipe model complexity (0=lite, 1=full)
             use_hands_for_gesture: Enable hand detection for gesture recognition
+            enable_lstm: Enable LSTM predictive tracking (Phase 2)
         """
         if not MEDIAPIPE_AVAILABLE:
             raise ImportError("MediaPipe is required for MasterVisionSystem")
@@ -112,10 +124,21 @@ class MasterVisionSystem:
         # 1. Depth Estimator (AEC)
         self.depth_estimator = AnchorDepthEstimator()
         
-        # 2. Flow-Gated Validator (Sensor Fusion)
-        self.flow_validator = FlowGatedValidator()
+        # 2. LSTM Predictive Tracker (Phase 2)
+        self.lstm_predictor = None
+        self.lstm_enabled = enable_lstm and LSTM_AVAILABLE
+        if self.lstm_enabled:
+            try:
+                self.lstm_predictor = PredictiveTracker(buffer_size=10, device='cuda')
+                print("[VISION] LSTM Predictive Tracking enabled (GPU)")
+            except Exception as e:
+                print(f"[VISION] LSTM init failed: {e}")
+                self.lstm_enabled = False
         
-        # 3. Punch FSM (State Machine)
+        # 3. Flow-Gated Validator (Sensor Fusion with LSTM Layer 2)
+        self.flow_validator = FlowGatedValidator(lstm_predictor=self.lstm_predictor)
+        
+        # 4. Punch FSM (State Machine)
         self.punch_detector = PunchDetector()
         
         # 4. Position smoothers for final output
@@ -154,7 +177,7 @@ class MasterVisionSystem:
         # Statistics
         self.total_punches = {'Left': 0, 'Right': 0}
         
-        print("[VISION] Master Vision System v2 initialized (POSE wrist mode)")
+        print("[VISION] Master Vision System v2.1 initialized (POSE wrist + LSTM)")
     
     def start(self):
         """Initialize camera and start processing."""
@@ -286,6 +309,13 @@ class MasterVisionSystem:
             ):
                 hand = handedness.classification[0].label
                 self.current_gesture[hand] = self.detect_gesture(hand_landmarks)
+                
+                # Feed hand landmarks to LSTM buffer for prediction training
+                if self.lstm_enabled and self.lstm_predictor is not None:
+                    confidence = handedness.classification[0].score
+                    self.lstm_predictor.buffer.add_landmarks(
+                        hand_landmarks, hand, confidence, timestamp
+                    )
         
         # Initialize results
         results = {

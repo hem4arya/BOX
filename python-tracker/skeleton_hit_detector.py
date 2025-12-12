@@ -14,12 +14,305 @@ QUICK WINS:
 MEDIUM EFFORT:
 7. Lucas-Kanade optical flow for motion validation
 8. Kalman Filter for state estimation [x, y, vx, vy, ax, ay]
+
+HEAVY LIFT:
+9. LSTM/TCN Temporal Classifier for punch type detection
+10. Inverse Kinematics (IK) Solver for 3D arm reconstruction
 """
 
 import numpy as np
 import cv2
 from collections import deque
 import time
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HEAVY LIFT #1: Lightweight LSTM-like Temporal Classifier
+# ════════════════════════════════════════════════════════════════════════════
+class TemporalPunchClassifier:
+    """
+    Lightweight temporal classifier for punch type detection.
+    
+    Uses a sliding window of features to classify punch types:
+    - JAB: Quick, straight, short recovery
+    - CROSS: Powerful, straight, body rotation
+    - HOOK: Arcing motion, horizontal velocity
+    - UPPERCUT: Upward motion, bent arm to straight
+    - NO_PUNCH: Guard/idle position
+    
+    This is a rule-based "LSTM-lite" that uses temporal patterns
+    without requiring a trained neural network.
+    """
+    
+    # Punch type constants
+    JAB = 'JAB'
+    CROSS = 'CROSS'
+    HOOK = 'HOOK'
+    UPPERCUT = 'UPPERCUT'
+    NO_PUNCH = 'NO_PUNCH'
+    
+    def __init__(self, window_size=15):
+        self.window_size = window_size
+        
+        # Feature history for each hand
+        self.feature_history = {
+            'Left': deque(maxlen=window_size),
+            'Right': deque(maxlen=window_size)
+        }
+        
+        # Current classification
+        self.current_punch = {'Left': self.NO_PUNCH, 'Right': self.NO_PUNCH}
+        self.punch_confidence = {'Left': 0.0, 'Right': 0.0}
+        
+        # Punch in progress tracking
+        self.punch_start_frame = {'Left': -100, 'Right': -100}
+        self.frame_count = 0
+    
+    def extract_features(self, results_dict, hand):
+        """Extract temporal features from current frame results."""
+        return {
+            'velocity': results_dict.get('velocity', 0),
+            'depth_percent': results_dict.get('depth_percent', 0),
+            'elbow_angle': results_dict.get('elbow_angle', 90),
+            'trajectory_phase': results_dict.get('trajectory_phase', 'IDLE'),
+            'kinetic_energy': results_dict.get('kinetic_energy', 0),
+            'direction_consistency': results_dict.get('direction_consistency', 0),
+            'is_straight': results_dict.get('is_straight', False),
+        }
+    
+    def update(self, results_dict, hand):
+        """
+        Update classifier with new frame data.
+        
+        Returns:
+            tuple: (punch_type, confidence)
+        """
+        self.frame_count += 1
+        
+        # Extract and store features
+        features = self.extract_features(results_dict, hand)
+        self.feature_history[hand].append(features)
+        
+        # Need sufficient history
+        if len(self.feature_history[hand]) < 5:
+            return self.NO_PUNCH, 0.0
+        
+        # Classify based on temporal patterns
+        punch_type, confidence = self._classify_punch_type(hand)
+        
+        self.current_punch[hand] = punch_type
+        self.punch_confidence[hand] = confidence
+        
+        return punch_type, confidence
+    
+    def _classify_punch_type(self, hand):
+        """
+        Classify punch type using temporal feature patterns.
+        
+        Pattern matching based on biomechanical signatures:
+        - JAB: Quick velocity spike, moderate depth, quick recovery
+        - CROSS: Higher peak velocity, more depth, body rotation
+        - HOOK: Horizontal velocity > vertical, arcing trajectory
+        - UPPERCUT: Vertical velocity > horizontal, upward motion
+        """
+        history = list(self.feature_history[hand])
+        
+        # Aggregate features over window
+        velocities = [f['velocity'] for f in history]
+        depths = [f['depth_percent'] for f in history]
+        elbows = [f['elbow_angle'] for f in history]
+        ke_values = [f['kinetic_energy'] for f in history]
+        phases = [f['trajectory_phase'] for f in history]
+        
+        # Calculate statistics
+        max_vel = max(velocities) if velocities else 0
+        avg_vel = np.mean(velocities) if velocities else 0
+        max_depth = max(depths) if depths else 0
+        max_ke = max(ke_values) if ke_values else 0
+        
+        # Check for ACCEL -> PEAK -> DECEL pattern (ballistic signature)
+        has_ballistic = 'ACCEL' in phases and ('PEAK' in phases or 'DECEL' in phases)
+        
+        # Elbow extension pattern (guard -> straight)
+        elbow_start = elbows[0] if elbows else 90
+        elbow_end = elbows[-1] if elbows else 90
+        elbow_extension = elbow_end - elbow_start
+        
+        # No punch if velocity too low
+        if max_vel < 0.08:
+            return self.NO_PUNCH, 0.0
+        
+        # Classification logic based on biomechanical features
+        confidence = 0.0
+        punch_type = self.NO_PUNCH
+        
+        # JAB: Quick, moderate power, straight line
+        if max_vel > 0.1 and max_depth > 40 and max_depth < 80:
+            if elbow_extension > 20:  # Arm extends
+                punch_type = self.JAB
+                confidence = min(1.0, max_vel * 5)
+        
+        # CROSS: High power, deep extension
+        if max_vel > 0.15 and max_depth > 70:
+            if elbow_extension > 30 and has_ballistic:
+                punch_type = self.CROSS
+                confidence = min(1.0, max_depth / 100 * max_ke)
+        
+        # HOOK: Horizontal motion pattern (would need lateral velocity)
+        # For now, detect hooks by moderate depth + high KE + wide elbow
+        if max_vel > 0.12 and max_depth < 60 and max_ke > 0.5:
+            if np.mean(elbows) > 100 and np.mean(elbows) < 150:
+                punch_type = self.HOOK
+                confidence = min(1.0, max_ke)
+        
+        # UPPERCUT: Would need vertical velocity component
+        # Detect by low initial elbow -> high extension + depth increase
+        if elbow_extension > 40 and max_depth > 50:
+            if elbows[0] < 100:  # Started bent
+                punch_type = self.UPPERCUT
+                confidence = min(1.0, elbow_extension / 60)
+        
+        return punch_type, confidence
+    
+    def get_punch_name(self, hand):
+        """Get current detected punch type for hand."""
+        return self.current_punch[hand]
+    
+    def reset(self):
+        """Reset classifier state."""
+        for hand in ['Left', 'Right']:
+            self.feature_history[hand].clear()
+            self.current_punch[hand] = self.NO_PUNCH
+            self.punch_confidence[hand] = 0.0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HEAVY LIFT #2: Simplified Inverse Kinematics (Forearm-Only)
+# ════════════════════════════════════════════════════════════════════════════
+class ArmIKSolver:
+    """
+    Simplified IK solver using FOREARM ONLY (elbow → wrist).
+    
+    Why forearm-only?
+    - Fewer joints = less error propagation
+    - Forearm length is more consistent than full arm
+    - Works independently of shoulder position
+    - More reliable for punch depth estimation
+    
+    Z = sqrt(L² - P²) where L = calibrated forearm length, P = 2D projection
+    """
+    
+    def __init__(self):
+        # Calibrated forearm length (normalized by shoulder width)
+        self.forearm_length = {'Left': 0.8, 'Right': 0.8}  # Default estimates
+        self.calibrated = False
+        
+        # Store last valid IK depth for smoothing
+        self.last_ik_depth = {'Left': 0, 'Right': 0}
+    
+    def calibrate(self, pose_landmarks, shoulder_width):
+        """
+        Calibrate forearm length from T-pose (arms extended sideways).
+        In T-pose, Z ≈ 0, so 2D distance ≈ 3D distance.
+        """
+        for hand in ['Left', 'Right']:
+            if hand == 'Left':
+                elbow_idx, wrist_idx = 13, 15
+            else:
+                elbow_idx, wrist_idx = 14, 16
+            
+            elbow = pose_landmarks.landmark[elbow_idx]
+            wrist = pose_landmarks.landmark[wrist_idx]
+            
+            # Calculate 2D forearm length (normalized)
+            dx = wrist.x - elbow.x
+            dy = wrist.y - elbow.y
+            forearm_2d = np.sqrt(dx**2 + dy**2) / shoulder_width
+            
+            # Store calibrated length (with minimum bound)
+            self.forearm_length[hand] = max(0.3, forearm_2d)
+            
+            print(f"[IK CALIBRATE] {hand}: Forearm={self.forearm_length[hand]:.3f}")
+        
+        self.calibrated = True
+        print("[IK CALIBRATE] ✓ Forearm lengths calibrated for 3D reconstruction")
+    
+    def solve(self, pose_landmarks, shoulder_width, hand):
+        """
+        Simple forearm-only IK depth calculation.
+        
+        When forearm projects shorter in 2D than its calibrated length,
+        it MUST be going into depth (Z axis).
+        
+        Returns:
+            dict with wrist_z, elbow_z, ik_depth_percent
+        """
+        if hand == 'Left':
+            elbow_idx, wrist_idx = 13, 15
+        else:
+            elbow_idx, wrist_idx = 14, 16
+        
+        elbow = pose_landmarks.landmark[elbow_idx]
+        wrist = pose_landmarks.landmark[wrist_idx]
+        
+        # Calculate current 2D forearm length (normalized)
+        dx = wrist.x - elbow.x
+        dy = wrist.y - elbow.y
+        forearm_2d = np.sqrt(dx**2 + dy**2) / shoulder_width
+        
+        # Calibrated forearm length
+        L = self.forearm_length[hand]
+        
+        # IK depth calculation using Pythagoras
+        # If 2D projection < calibrated length, arm is going into depth
+        if forearm_2d < L * 0.95:  # Add 5% tolerance for noise
+            # Z = sqrt(L² - P²)
+            depth_z = np.sqrt(max(0, L**2 - forearm_2d**2))
+            ik_depth_percent = (depth_z / L) * 100
+        else:
+            # Arm is fully extended sideways (no depth)
+            depth_z = 0.0
+            ik_depth_percent = 0.0
+        
+        # Smooth with last value to reduce jitter
+        smoothed_depth = 0.7 * ik_depth_percent + 0.3 * self.last_ik_depth[hand]
+        self.last_ik_depth[hand] = smoothed_depth
+        
+        return {
+            'elbow_z': 0.0,  # Simplified - not tracking elbow depth
+            'wrist_z': depth_z,
+            'ik_depth_percent': smoothed_depth,
+            'forearm_2d': forearm_2d,
+            'forearm_cal': L
+        }
+    
+    def get_wrist_depth(self, hand):
+        """Get last computed IK depth percentage."""
+        return self.last_ik_depth[hand]
+    
+    def reset(self):
+        """Reset IK state."""
+        self.last_ik_depth = {'Left': 0, 'Right': 0}
+
+
+def fuse_depth(anthropometric_depth, ik_depth):
+    """
+    Fuse anthropometric and IK depth estimates.
+    
+    If IK fails (returns < 10%), trust anthropometric.
+    Otherwise, weighted average favoring anthropometric (more reliable).
+    
+    Returns:
+        combined_depth: Fused depth percentage
+    """
+    if ik_depth < 10:
+        # IK failed or very low - trust anthropometric
+        return anthropometric_depth
+    
+    # Both available - weighted average
+    # Anthropometric is typically more reliable
+    return 0.7 * anthropometric_depth + 0.3 * ik_depth
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -255,7 +548,7 @@ class SkeletonHitDetector:
     ELBOW_LEFT = 13
     ELBOW_RIGHT = 14
     
-    def __init__(self, velocity_threshold=0.10, cooldown_frames=8):
+    def __init__(self, velocity_threshold=0.18, cooldown_frames=12):
         """
         Args:
             velocity_threshold: Minimum normalized velocity to register hit
@@ -306,6 +599,32 @@ class SkeletonHitDetector:
         self.last_acceleration = {'Left': 0, 'Right': 0}
         
         # ════════════════════════════════════════════════════════════════
+        # FIX: SUSTAINED VELOCITY (prevent false positives)
+        # ════════════════════════════════════════════════════════════════
+        # Problem: Instant velocity triggers on twitches/adjustments
+        # Solution: Require SUSTAINED velocity over multiple frames
+        
+        # Approach 1: Rolling average velocity
+        self.velocity_buffer = {
+            'Left': deque(maxlen=5),
+            'Right': deque(maxlen=5)
+        }
+        self.sustained_velocity = {'Left': 0, 'Right': 0}
+        
+        # Approach 2: Acceleration check (must be speeding up)
+        self.velocity_rising_count = {'Left': 0, 'Right': 0}
+        
+        # Approach 3: Distance traveled in punch window
+        self.distance_traveled = {'Left': 0, 'Right': 0}
+        self.distance_window_start = {'Left': 0, 'Right': 0}
+        
+        # Tuning parameters
+        self.SUSTAINED_VELOCITY_FRAMES = 3  # Must be fast for 3+ frames
+        self.MIN_ACCELERATION_FRAMES = 2    # Must accelerate for 2+ frames
+        self.MIN_DISTANCE_TRAVELED = 0.08   # Minimum distance for valid punch
+        self.DISTANCE_WINDOW_FRAMES = 15    # Window for distance accumulation
+        
+        # ════════════════════════════════════════════════════════════════
         # MEDIUM EFFORT: Optical Flow + Kalman Filter
         # ════════════════════════════════════════════════════════════════
         
@@ -322,6 +641,21 @@ class SkeletonHitDetector:
         self.kalman_velocity = {'Left': np.zeros(2), 'Right': np.zeros(2)}
         self.kalman_accel = {'Left': np.zeros(2), 'Right': np.zeros(2)}
         self.flow_validated = {'Left': False, 'Right': False}
+        
+        # ════════════════════════════════════════════════════════════════
+        # HEAVY LIFT: LSTM Classifier + IK Solver
+        # ════════════════════════════════════════════════════════════════
+        
+        # Temporal Punch Classifier (JAB, CROSS, HOOK, UPPERCUT detection)
+        self.punch_classifier = TemporalPunchClassifier(window_size=15)
+        
+        # Inverse Kinematics Solver (3D arm reconstruction)
+        self.ik_solver = ArmIKSolver()
+        
+        # Heavy lift results
+        self.detected_punch_type = {'Left': 'NO_PUNCH', 'Right': 'NO_PUNCH'}
+        self.punch_confidence = {'Left': 0.0, 'Right': 0.0}
+        self.ik_depth_percent = {'Left': 0, 'Right': 0}
         
         # ═══════════════════════════════════════════════════════════════
         # ANTHROPOMETRIC DEPTH CALIBRATION
@@ -525,6 +859,76 @@ class SkeletonHitDetector:
         
         self.trajectory_phase[hand] = phase
         return phase
+    
+    # ════════════════════════════════════════════════════════════════════
+    # FIX: Sustained Velocity Calculation
+    # ════════════════════════════════════════════════════════════════════
+    def calculate_sustained_velocity(self, instant_velocity, hand):
+        """
+        Calculate sustained velocity using rolling average.
+        
+        Returns:
+            sustained_velocity: Average velocity over last N frames
+            is_sustained: True if velocity has been above threshold for N frames
+        """
+        self.velocity_buffer[hand].append(instant_velocity)
+        
+        if len(self.velocity_buffer[hand]) < self.SUSTAINED_VELOCITY_FRAMES:
+            return 0.0, False
+        
+        # Rolling average of last N frames
+        recent = list(self.velocity_buffer[hand])[-self.SUSTAINED_VELOCITY_FRAMES:]
+        sustained = sum(recent) / len(recent)
+        self.sustained_velocity[hand] = sustained
+        
+        # Check if ALL recent frames are above threshold
+        is_sustained = all(v > self.velocity_threshold * 0.7 for v in recent)
+        
+        return sustained, is_sustained
+    
+    def check_acceleration_trend(self, instant_velocity, hand):
+        """
+        Check if velocity is increasing (acceleration phase).
+        
+        A real punch accelerates - velocity increases over 2-3 frames.
+        A twitch is instant spike then drop.
+        
+        Returns:
+            is_accelerating: True if velocity rising for MIN_ACCELERATION_FRAMES
+        """
+        prev_velocity = self.last_velocity.get(hand, 0)
+        
+        if instant_velocity > prev_velocity * 1.05:  # 5% increase
+            self.velocity_rising_count[hand] += 1
+        else:
+            self.velocity_rising_count[hand] = max(0, self.velocity_rising_count[hand] - 1)
+        
+        return self.velocity_rising_count[hand] >= self.MIN_ACCELERATION_FRAMES
+    
+    def update_distance_traveled(self, instant_velocity, hand):
+        """
+        Track total distance traveled in punch window.
+        
+        A real punch travels significant distance.
+        A twitch moves fast but doesn't go far.
+        
+        Returns:
+            distance: Total distance traveled in current window
+            is_sufficient: True if distance exceeds MIN_DISTANCE_TRAVELED
+        """
+        # Accumulate distance
+        self.distance_traveled[hand] += instant_velocity
+        
+        # Check window duration
+        frames_in_window = self.frame_count - self.distance_window_start[hand]
+        
+        if frames_in_window > self.DISTANCE_WINDOW_FRAMES:
+            # Reset window
+            self.distance_window_start[hand] = self.frame_count
+            self.distance_traveled[hand] = instant_velocity
+        
+        is_sufficient = self.distance_traveled[hand] > self.MIN_DISTANCE_TRAVELED
+        return self.distance_traveled[hand], is_sufficient
     
     def _get_arm_geometry(self, pose_landmarks, hand):
         """
@@ -812,31 +1216,88 @@ class SkeletonHitDetector:
             results[hand]['trajectory_phase'] = trajectory_phase
             
             # ════════════════════════════════════════════════════════════
-            # ENHANCED HIT DETECTION (with Quick Wins!)
+            # HEAVY LIFT: IK Solver + Punch Classifier
             # ════════════════════════════════════════════════════════════
-            # PUNCH = fast + straight + forward depth + consistent direction
-            # + ballistic trajectory (ACCEL or PEAK phase)
+            
+            # IK Solver: Reconstruct 3D arm pose (forearm-only)
+            ik_result = self.ik_solver.solve(pose_landmarks, shoulder_width, hand)
+            ik_depth = ik_result['ik_depth_percent']
+            self.ik_depth_percent[hand] = ik_depth
+            
+            # FUSE DEPTHS: Combine anthropometric + IK for better accuracy
+            fused = fuse_depth(effective_depth, ik_depth)
+            
+            # Add IK and fused results
+            results[hand]['ik_depth_percent'] = ik_depth
+            results[hand]['fused_depth'] = fused
+            results[hand]['wrist_z'] = ik_result['wrist_z']
+            results[hand]['elbow_z'] = ik_result['elbow_z']
+            
+            # Punch Classifier: Detect punch type (JAB, CROSS, HOOK, UPPERCUT)
+            punch_type, punch_conf = self.punch_classifier.update(results[hand], hand)
+            self.detected_punch_type[hand] = punch_type
+            self.punch_confidence[hand] = punch_conf
+            
+            # Add punch classification results
+            results[hand]['punch_type'] = punch_type
+            results[hand]['punch_confidence'] = punch_conf
+            
+            # ════════════════════════════════════════════════════════════
+            # FIX: SUSTAINED VELOCITY HIT DETECTION
+            # ════════════════════════════════════════════════════════════
+            # Problem: Instant velocity triggers on twitches/adjustments
+            # Solution: Require SUSTAINED velocity + acceleration + distance
+            
+            # Calculate sustained velocity metrics
+            sustained_vel, is_sustained = self.calculate_sustained_velocity(velocity, hand)
+            is_accelerating = self.check_acceleration_trend(velocity, hand)
+            distance, has_distance = self.update_distance_traveled(velocity, hand)
             
             in_cooldown = (self.frame_count - self.last_hit_frame[hand]) < self.cooldown_frames
             
-            is_fast = velocity > self.velocity_threshold
+            # Core punch requirements
+            is_fast = sustained_vel > self.velocity_threshold  # Use sustained, not instant!
             is_straight = elbow_angle >= ELBOW_THRESHOLD
             is_forward = effective_depth > 40
-            is_consistent = direction_consistency > 0.5  # Movement in one direction
-            is_ballistic = trajectory_phase in ['ACCEL', 'PEAK']  # Accelerating or at peak
+            is_consistent = direction_consistency > 0.5
+            is_ballistic = trajectory_phase in ['ACCEL', 'PEAK']
             
-            # Enhanced hit detection: require more conditions for higher confidence
-            # Fast + Straight + Forward = basic hit
-            # + Consistent + Ballistic = confirmed punch
+            # ═══════════════════════════════════════════════════════════════
+            # STRICT HIT DETECTION (v2): Require MULTIPLE quality checks!
+            # ═══════════════════════════════════════════════════════════════
+            # Problem: OR logic too permissive - any one quality check passes
+            # Solution: Require AT LEAST 2 out of 3 quality checks!
             
-            basic_hit = is_fast and is_straight and is_forward
-            high_confidence = basic_hit and (is_consistent or is_ballistic)
+            core_requirements = is_fast and is_straight and is_forward
             
-            if high_confidence and not in_cooldown:
+            # Count how many quality checks pass
+            quality_score = 0
+            if is_sustained:  # Must have sustained velocity for 3+ frames
+                quality_score += 1
+            if is_accelerating:  # Must be accelerating
+                quality_score += 1
+            if has_distance:  # Must have traveled sufficient distance
+                quality_score += 1
+            if is_consistent:  # Consistent direction
+                quality_score += 1
+            
+            # Require AT LEAST 2 quality checks to pass (was: any 1)
+            quality_check = quality_score >= 2
+            
+            # ADDITIONAL FIX: Require a classified punch type (not NO_PUNCH)
+            has_punch_type = punch_type != 'NO_PUNCH'
+            
+            valid_punch = core_requirements and quality_check and has_punch_type
+            
+            if valid_punch and not in_cooldown:
                 # HIGH CONFIDENCE PUNCH DETECTED!
                 results[hand]['hit'] = True
                 self.last_hit_frame[hand] = self.frame_count
                 self.hit_count[hand] += 1
+                # Reset distance after hit
+                self.distance_traveled[hand] = 0
+                # Reset velocity buffer to require build-up for next punch
+                self.velocity_buffer[hand].clear()
         
         return results
     
@@ -970,9 +1431,18 @@ if __name__ == "__main__":
                 traj_phase = hit_results[hand].get('trajectory_phase', 'IDLE')
                 ke = hit_results[hand].get('kinetic_energy', 0)
                 
+                # Get heavy lift values
+                punch_type = hit_results[hand].get('punch_type', 'NO_PUNCH')
+                punch_conf = hit_results[hand].get('punch_confidence', 0)
+                ik_depth = hit_results[hand].get('ik_depth_percent', 0)
+                
                 # Phase color
                 phase_colors = {'ACCEL': (0, 255, 0), 'PEAK': (0, 255, 255), 'DECEL': (255, 165, 0), 'IDLE': (100, 100, 100)}
                 phase_color = phase_colors.get(traj_phase, (100, 100, 100))
+                
+                # Punch type color
+                punch_colors = {'JAB': (0, 255, 255), 'CROSS': (0, 128, 255), 'HOOK': (255, 0, 255), 'UPPERCUT': (255, 255, 0), 'NO_PUNCH': (100, 100, 100)}
+                punch_color = punch_colors.get(punch_type, (100, 100, 100))
                 
                 # Labels
                 cv2.putText(frame, f"{hand}", (bar_x, 440), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -980,12 +1450,17 @@ if __name__ == "__main__":
                 cv2.putText(frame, f"E={elbow:.0f}°", (bar_x, 478), cv2.FONT_HERSHEY_SIMPLEX, 0.4, elbow_color, 1)
                 cv2.putText(frame, f"{traj_phase}", (bar_x + 60, 478), cv2.FONT_HERSHEY_SIMPLEX, 0.4, phase_color, 1)
                 
-                # HIT indicator
+                # Show punch type when not NO_PUNCH
+                if punch_type != 'NO_PUNCH':
+                    cv2.putText(frame, f"{punch_type}", (bar_x, 498), cv2.FONT_HERSHEY_SIMPLEX, 0.5, punch_color, 2)
+                
+                # HIT indicator with punch type
                 if hit:
                     hit_x = 200 if hand == 'Left' else w - 300
-                    cv2.putText(frame, ">>> PUNCH! <<<", (hit_x, 100), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3)
-                    print(f">>> {hand} PUNCH! D={depth_pct:.0f}% {traj_phase} KE={ke:.2f} (#{detector.hit_count[hand]})")
+                    label = f">>> {punch_type}! <<<" if punch_type != 'NO_PUNCH' else ">>> PUNCH! <<<"
+                    cv2.putText(frame, label, (hit_x, 100), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.5, punch_color, 3)
+                    print(f">>> {hand} {punch_type}! D={depth_pct:.0f}% IK={ik_depth:.0f}% {traj_phase} (#{detector.hit_count[hand]})")
             
             # Stats overlay
             stats = detector.get_stats()

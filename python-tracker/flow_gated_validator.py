@@ -21,6 +21,7 @@ import time
 # Color coding for tracking sources
 TRACKING_COLORS = {
     'mediapipe': (0, 255, 0),     # GREEN - High confidence
+    'lstm': (255, 255, 0),         # CYAN - Neural prediction (Layer 2)
     'optical_flow': (0, 165, 255), # ORANGE - Bridging blur
     'ballistic': (0, 0, 255),      # RED - Prediction only
     'lost': (128, 128, 128),       # GRAY - Lost tracking
@@ -189,28 +190,38 @@ class BallisticExtrapolator:
 
 class FlowGatedValidator:
     """
-    Main sensor fusion class that combines:
-    1. MediaPipe pose estimation
-    2. Optical Flow tracking
-    3. Ballistic extrapolation
+    Main sensor fusion class with 5-layer fallback hierarchy:
+    
+    Layer 1: MediaPipe (High Confidence)  → Trust Oracle
+    Layer 2: LSTM Prediction (NEW)        → Neural Hallucination  
+    Layer 3: Optical Flow (L-K Tracking)  → Visual Tracking
+    Layer 4: Ballistic Extrapolation      → Physics Simulation
+    Layer 5: Lost                         → No data
     
     Uses a gating mechanism to select the most reliable source.
     """
     
-    def __init__(self, confidence_threshold=0.5, flow_threshold=5.0):
+    def __init__(self, confidence_threshold=0.5, flow_threshold=5.0, lstm_predictor=None):
         """
         Args:
             confidence_threshold: Minimum MediaPipe confidence to trust
             flow_threshold: Minimum flow magnitude to trust optical flow
+            lstm_predictor: Optional PredictiveTracker for Layer 2 LSTM fallback
         """
         self.confidence_threshold = confidence_threshold
         self.flow_threshold = flow_threshold
         
-        # Trackers for each hand
+        # Layer 2: LSTM Predictor (optional)
+        self.lstm_predictor = lstm_predictor
+        self.lstm_enabled = lstm_predictor is not None
+        
+        # Layer 3: Optical Flow Trackers
         self.flow_tracker = {
             'Left': OpticalFlowTracker(),
             'Right': OpticalFlowTracker()
         }
+        
+        # Layer 4: Ballistic Extrapolators
         self.ballistic = {
             'Left': BallisticExtrapolator(),
             'Right': BallisticExtrapolator()
@@ -222,7 +233,10 @@ class FlowGatedValidator:
         self.tracking_source = {'Left': 'none', 'Right': 'none'}
         
         # Statistics
-        self.source_counts = {'mediapipe': 0, 'optical_flow': 0, 'ballistic': 0, 'lost': 0}
+        self.source_counts = {'mediapipe': 0, 'lstm': 0, 'optical_flow': 0, 'ballistic': 0, 'lost': 0}
+        
+        if self.lstm_enabled:
+            print("[FlowGatedValidator] LSTM Layer 2 enabled")
     
     def validate(self, hand, mp_position, mp_confidence, gray_frame, frame_width, frame_height, timestamp=None):
         """
@@ -262,7 +276,13 @@ class FlowGatedValidator:
             
             return mp_position, 'mediapipe', mp_confidence
         
-        # CASE B: MediaPipe failed, try Optical Flow
+        # CASE B: MediaPipe failed, try LSTM Prediction (Layer 2)
+        if self.lstm_enabled and self.lstm_predictor is not None:
+            lstm_result = self._try_lstm_prediction(hand, frame_width, frame_height, timestamp)
+            if lstm_result is not None:
+                return lstm_result
+        
+        # CASE C: LSTM failed or unavailable, try Optical Flow (Layer 3)
         flow_pos, flow_vector, flow_quality = self.flow_tracker[hand].track(gray_frame)
         flow_magnitude = np.linalg.norm(flow_vector)
         
@@ -280,7 +300,7 @@ class FlowGatedValidator:
             
             return normalized, 'optical_flow', flow_quality
         
-        # CASE C: Optical Flow failed, try Ballistic
+        # CASE D: Optical Flow failed, try Ballistic (Layer 4)
         ballistic_pos, ballistic_conf = self.ballistic[hand].predict(timestamp)
         
         if ballistic_pos is not None and ballistic_conf > 0.3:
@@ -296,10 +316,67 @@ class FlowGatedValidator:
             
             return normalized, 'ballistic', ballistic_conf
         
-        # CASE D: All failed, return last known position
+        # CASE E: All failed, return last known position (Layer 5)
         self.tracking_source[hand] = 'lost'
         self.source_counts['lost'] += 1
         return self.last_position[hand], 'lost', 0.0
+    
+    def _try_lstm_prediction(self, hand, frame_width, frame_height, timestamp):
+        """
+        Layer 2: Try LSTM prediction when MediaPipe fails.
+        Returns (position, source, confidence) or None if LSTM fails.
+        """
+        try:
+            # Check if LSTM has predictions for this hand
+            if not hasattr(self.lstm_predictor, 'buffer'):
+                return None
+            
+            if not self.lstm_predictor.buffer.is_ready(hand):
+                return None
+            
+            # Get LSTM prediction
+            last_known = self.lstm_predictor.buffer.get_last_landmarks(hand)
+            if last_known is None:
+                return None
+            
+            # Make prediction
+            predictions = self.lstm_predictor.predict_multi_step(hand, num_steps=1)
+            if not predictions:
+                return None
+            
+            predicted = predictions[0]
+            
+            # Get wrist position from prediction (indices 0, 1 are wrist x, y)
+            wrist_x = float(predicted[0])
+            wrist_y = float(predicted[1])
+            
+            # Clamp to valid range
+            wrist_x = max(0.0, min(1.0, wrist_x))
+            wrist_y = max(0.0, min(1.0, wrist_y))
+            normalized = (wrist_x, wrist_y)
+            
+            # Update state
+            self.last_position[hand] = normalized
+            self.last_confidence[hand] = 0.7  # LSTM predictions have ~0.7 confidence
+            self.tracking_source[hand] = 'lstm'
+            self.source_counts['lstm'] += 1
+            
+            # Also update ballistic with this prediction for Layer 4 fallback
+            pixel_pos = np.array([wrist_x * frame_width, wrist_y * frame_height])
+            self.ballistic[hand].update(pixel_pos, timestamp)
+            
+            return normalized, 'lstm', 0.7
+            
+        except Exception as e:
+            # LSTM failed, return None to try next layer
+            return None
+    
+    def set_lstm_predictor(self, predictor):
+        """Set or update the LSTM predictor."""
+        self.lstm_predictor = predictor
+        self.lstm_enabled = predictor is not None
+        if self.lstm_enabled:
+            print("[FlowGatedValidator] LSTM Layer 2 enabled")
     
     def get_status(self, hand):
         """Get current tracking status for a hand."""
