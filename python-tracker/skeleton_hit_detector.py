@@ -548,7 +548,7 @@ class SkeletonHitDetector:
     ELBOW_LEFT = 13
     ELBOW_RIGHT = 14
     
-    def __init__(self, velocity_threshold=0.18, cooldown_frames=12):
+    def __init__(self, velocity_threshold=0.17, cooldown_frames=15):
         """
         Args:
             velocity_threshold: Minimum normalized velocity to register hit
@@ -1154,8 +1154,26 @@ class SkeletonHitDetector:
             self.kalman_velocity[hand] = kalman_vel
             self.kalman_accel[hand] = kalman_accel
             
-            # Use Kalman-smoothed speed for hit detection (more stable)
-            velocity = kalman_speed * 10  # Scale to match raw velocity range
+            # ════════════════════════════════════════════════════════════
+            # FIX: 5-FRAME VELOCITY CALCULATION (filters out jitter)
+            # ════════════════════════════════════════════════════════════
+            # Instead of frame-to-frame (noisy), measure distance over 5 frames
+            VELOCITY_FRAMES = 5
+            DEAD_ZONE = 0.04  # Below this = treated as 0
+            
+            if len(self.position_history[hand]) >= VELOCITY_FRAMES + 1:
+                # Distance from 5 frames ago to now
+                old_pos = self.position_history[hand][-VELOCITY_FRAMES-1]['pos']
+                distance = np.linalg.norm(current_pos - old_pos)
+                raw_velocity = distance / VELOCITY_FRAMES  # Average velocity
+            else:
+                raw_velocity = 0.0
+            
+            # Apply dead zone
+            if raw_velocity < DEAD_ZONE:
+                velocity = 0.0
+            else:
+                velocity = raw_velocity
             
             # ════════════════════════════════════════════════════════════
             # QUICK WINS INTEGRATION
@@ -1340,20 +1358,26 @@ if __name__ == "__main__":
     print("Press Q to quit, R to reset")
     print("=" * 60)
     
-    # Initialize
+    # Initialize - OPTIMIZED FOR 30+ FPS
     cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)   # Reduced from 1280
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)  # Reduced from 720
+    cap.set(cv2.CAP_PROP_FPS, 30)  # Request 30 FPS
     
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(
-        model_complexity=1,
+        model_complexity=0,  # Changed from 1 - LITE model, much faster!
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
     )
     mp_draw = mp.solutions.drawing_utils
     
-    detector = SkeletonHitDetector(velocity_threshold=0.12)
+    detector = SkeletonHitDetector(velocity_threshold=0.17)
+    
+    # FPS tracking
+    fps_counter = 0
+    fps_start_time = time.time()
+    current_fps = 0
     
     # Calibration countdown timer
     calibration_countdown = 0  # Seconds remaining (0 = not counting)
@@ -1363,6 +1387,13 @@ if __name__ == "__main__":
         ret, frame = cap.read()
         if not ret:
             break
+        
+        # FPS Calculation
+        fps_counter += 1
+        if fps_counter >= 10:  # Update every 10 frames
+            current_fps = fps_counter / (time.time() - fps_start_time)
+            fps_start_time = time.time()
+            fps_counter = 0
         
         # Mirror the frame for natural interaction
         frame = cv2.flip(frame, 1)
@@ -1397,13 +1428,22 @@ if __name__ == "__main__":
                 elbow = hit_results[hand]['elbow_angle']
                 is_straight = hit_results[hand].get('is_straight', False)
                 
-                # Velocity bar (left side of pair)
-                vel_h = int(min(vel / 0.3, 1.0) * 200)
+                # Velocity bar (FIX: increased max to 0.50 for better range)
+                MAX_VEL_DISPLAY = 0.50
+                vel_h = int(min(vel / MAX_VEL_DISPLAY, 1.0) * 200)
                 
-                # Velocity bar color: GREEN if fast, RED if slow
-                vel_color = (0, 255, 0) if vel > detector.velocity_threshold else (0, 0, 255)
+                # Velocity bar color based on punch threshold (0.35)
+                # GREEN = punch speed, YELLOW = fast movement, RED = slow/idle
+                if vel > detector.velocity_threshold:  # > 0.35
+                    vel_color = (0, 255, 0)  # Green - punch speed!
+                elif vel > 0.15:  # 0.15 - 0.35 = fast movement
+                    vel_color = (0, 200, 200)  # Yellow - moving
+                elif vel > 0.04:  # 0.04 - 0.15 = light movement
+                    vel_color = (0, 128, 255)  # Orange - light
+                else:
+                    vel_color = (0, 0, 255)  # Red - slow
                 cv2.rectangle(frame, (bar_x, 400 - vel_h), (bar_x + bar_w, 400), vel_color, -1)
-                cv2.putText(frame, "VEL", (bar_x, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame, f"V:{vel:.2f}", (bar_x - 5, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
                 
                 # Depth bar (right side of pair)
                 depth_x = bar_x + bar_w + 10
@@ -1475,6 +1515,10 @@ if __name__ == "__main__":
                 cv2.putText(frame, "Press C to calibrate (T-pose)", (w//2 - 140, 80), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         
+        # FPS Display (always show, even without landmarks)
+        fps_color = (0, 255, 0) if current_fps >= 25 else (0, 165, 255) if current_fps >= 15 else (0, 0, 255)
+        cv2.putText(frame, f"FPS: {current_fps:.0f}", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, fps_color, 2)
         # ════════════════════════════════════════════════════════════
         # CALIBRATION COUNTDOWN DISPLAY
         # ════════════════════════════════════════════════════════════
