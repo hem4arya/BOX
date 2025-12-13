@@ -11,6 +11,7 @@ pub use landmarks::{
     update_landmarks, 
     physics_tick,
     calibrate_depth,
+    apply_mediapipe_correction,
     // Internal API
     get_all_landmarks, 
     get_predicted_wrists,

@@ -16,6 +16,7 @@ pub use bridge::{
     update_landmarks, 
     physics_tick, 
     calibrate_depth, 
+    apply_mediapipe_correction,
     init_classifier,
     set_classifier_ready,
     get_classification_buffer,

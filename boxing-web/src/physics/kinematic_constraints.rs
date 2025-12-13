@@ -109,3 +109,113 @@ impl Default for KinematicConstraints {
         Self::new()
     }
 }
+
+// ============================================================================
+// LAYER 3: VELOCITY CLAMPING
+// ============================================================================
+
+/// Maximum allowed movement per frame (30% of screen at 30Hz)
+/// Olympic boxer punch: ~15 m/s ≈ 0.3 normalized units per frame
+const MAX_VELOCITY: f32 = 0.3;
+
+/// Clamp position to maximum human velocity
+/// If movement exceeds MAX_VELOCITY, limit it while preserving direction.
+pub fn clamp_velocity(current: (f32, f32), previous: (f32, f32)) -> (f32, f32) {
+    let dx = current.0 - previous.0;
+    let dy = current.1 - previous.1;
+    let speed = (dx * dx + dy * dy).sqrt();
+    
+    if speed <= MAX_VELOCITY {
+        current  // Valid velocity
+    } else {
+        // Clamp to max velocity in same direction
+        let ratio = MAX_VELOCITY / speed;
+        (
+            previous.0 + dx * ratio,
+            previous.1 + dy * ratio,
+        )
+    }
+}
+
+// ============================================================================
+// LAYER 4: OUTLIER REJECTION
+// ============================================================================
+
+/// Maximum allowed jump distance from prediction (15% of screen)
+const MAX_JUMP: f32 = 0.15;
+
+/// Reject outlier measurements that teleport too far from prediction.
+/// Returns the measurement if valid, or falls back to predicted position.
+pub fn reject_outlier(
+    measured: (f32, f32), 
+    predicted: (f32, f32),
+    previous: (f32, f32),
+) -> ((f32, f32), bool) {
+    let dx = measured.0 - predicted.0;
+    let dy = measured.1 - predicted.1;
+    let jump = (dx * dx + dy * dy).sqrt();
+    
+    if jump > MAX_JUMP {
+        // Outlier! Use smooth interpolation toward prediction
+        // Don't snap - blend toward predicted
+        let blend = 0.3;
+        let blended = (
+            previous.0 + (predicted.0 - previous.0) * blend,
+            previous.1 + (predicted.1 - previous.1) * blend,
+        );
+        (blended, true)  // true = outlier was rejected
+    } else {
+        (measured, false)  // Accept measurement
+    }
+}
+
+// ============================================================================
+// LAYER 2: JOINT ANGLE LIMITS
+// ============================================================================
+
+/// Clamp elbow angle to human range [30°, 180°]
+/// Returns adjusted wrist position if angle was out of range.
+pub fn clamp_elbow_angle(
+    shoulder: (f32, f32),
+    elbow: (f32, f32),
+    wrist: (f32, f32),
+) -> ((f32, f32), bool) {
+    // Calculate current angle
+    let v1 = (shoulder.0 - elbow.0, shoulder.1 - elbow.1);
+    let v2 = (wrist.0 - elbow.0, wrist.1 - elbow.1);
+    
+    let dot = v1.0 * v2.0 + v1.1 * v2.1;
+    let mag1 = (v1.0 * v1.0 + v1.1 * v1.1).sqrt();
+    let mag2 = (v2.0 * v2.0 + v2.1 * v2.1).sqrt();
+    
+    if mag1 < 0.0001 || mag2 < 0.0001 {
+        return (wrist, false);
+    }
+    
+    let cos_angle = (dot / (mag1 * mag2)).clamp(-1.0, 1.0);
+    let angle = cos_angle.acos().to_degrees();
+    
+    // Valid human elbow range
+    const MIN_ANGLE: f32 = 30.0;
+    const MAX_ANGLE: f32 = 180.0;
+    
+    if angle >= MIN_ANGLE && angle <= MAX_ANGLE {
+        return (wrist, false);  // Valid angle
+    }
+    
+    // Clamp to nearest valid angle
+    let target_angle = angle.clamp(MIN_ANGLE, MAX_ANGLE);
+    let target_rad = target_angle.to_radians();
+    
+    // Rotate wrist around elbow
+    let upper_angle = v1.1.atan2(v1.0);
+    let new_angle = upper_angle + std::f32::consts::PI - target_rad;
+    
+    let new_wrist = (
+        elbow.0 + new_angle.cos() * mag2,
+        elbow.1 + new_angle.sin() * mag2,
+    );
+    
+    (new_wrist, true)  // true = angle was clamped
+}
+

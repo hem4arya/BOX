@@ -16,11 +16,13 @@ struct Metrics {
     onnx_latency_ms: f32,
     physics_time_ms: f32,
     
-    /// Per-arm data (from bridge)
+    /// Per-arm data
     left_depth: f32,
     left_angle: f32,
+    left_velocity: f32,
     right_depth: f32,
     right_angle: f32,
+    right_velocity: f32,
     
     /// Depth validity
     left_valid: bool,
@@ -37,8 +39,10 @@ impl Default for Metrics {
             physics_time_ms: 0.0,
             left_depth: 0.0,
             left_angle: 180.0,
+            left_velocity: 0.0,
             right_depth: 0.0,
             right_angle: 180.0,
+            right_velocity: 0.0,
             left_valid: false,
             right_valid: false,
         }
@@ -98,16 +102,18 @@ pub fn set_physics_time(ms: f32) {
 
 /// Update arm metrics from bridge data
 pub fn update_arm_metrics(
-    left_depth: f32, left_angle: f32, left_valid: bool,
-    right_depth: f32, right_angle: f32, right_valid: bool,
+    left_depth: f32, left_angle: f32, left_velocity: f32, left_valid: bool,
+    right_depth: f32, right_angle: f32, right_velocity: f32, right_valid: bool,
 ) {
     METRICS.with(|m| {
         let mut metrics = m.borrow_mut();
         metrics.left_depth = left_depth;
         metrics.left_angle = left_angle;
+        metrics.left_velocity = left_velocity;
         metrics.left_valid = left_valid;
         metrics.right_depth = right_depth;
         metrics.right_angle = right_angle;
+        metrics.right_velocity = right_velocity;
         metrics.right_valid = right_valid;
     });
 }
@@ -121,16 +127,19 @@ pub fn get_debug_overlay_text() -> String {
             "FPS: {:.0} | Frame: {:.1}ms\n\
              MediaPipe: {:.0}ms | ONNX: {:.0}ms\n\
              Physics: {:.1}ms\n\
-             L: {:.0}%{} {:.0}° | R: {:.0}%{} {:.0}°",
+             L: {:.0}%{} {:.0}° v{:.2}\n\
+             R: {:.0}%{} {:.0}° v{:.2}",
             metrics.fps, metrics.frame_time_ms,
             metrics.mediapipe_latency_ms, metrics.onnx_latency_ms,
             metrics.physics_time_ms,
             metrics.left_depth,
             if metrics.left_valid { "✓" } else { "✗" },
             metrics.left_angle,
+            metrics.left_velocity,
             metrics.right_depth,
             if metrics.right_valid { "✓" } else { "✗" },
             metrics.right_angle,
+            metrics.right_velocity,
         )
     })
 }

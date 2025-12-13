@@ -7,7 +7,9 @@ use wasm_bindgen::prelude::*;
 use std::cell::RefCell;
 use crate::physics::{
     KalmanFilter, DepthEstimator, DepthResult, VelocityTracker, 
-    calculate_elbow_angle, OneEuroFilter2D, KinematicConstraints
+    calculate_elbow_angle, OneEuroFilter2D, KinematicConstraints,
+    PunchDetector, PunchType,
+    clamp_velocity, reject_outlier, clamp_elbow_angle,
 };
 
 // ============================================================================
@@ -82,6 +84,9 @@ struct PhysicsState {
     depth_estimator: DepthEstimator,
     left_constraints: KinematicConstraints,
     right_constraints: KinematicConstraints,
+    punch_detector: PunchDetector,
+    last_punch: PunchType,
+    last_punch_confidence: f32,
     has_data: bool,
     shoulder_width: f32,
     left_elbow_angle: f32,
@@ -109,6 +114,9 @@ impl Default for PhysicsState {
             depth_estimator: DepthEstimator::new(),
             left_constraints: KinematicConstraints::new(),
             right_constraints: KinematicConstraints::new(),
+            punch_detector: PunchDetector::new(),
+            last_punch: PunchType::Idle,
+            last_punch_confidence: 0.0,
             has_data: false,
             shoulder_width: 0.0,
             left_elbow_angle: 180.0,
@@ -200,25 +208,24 @@ pub fn update_landmarks(data: &[f32]) {
             (right_wrist.x, right_wrist.y),
         );
         
-        // Calculate depth with verticality filter
-        if let Some(result) = state.depth_estimator.calculate_with_filter(
+        // Calculate GATED depth (elbow + direction gates)
+        let left_result = state.depth_estimator.calculate_gated(
             (left_wrist.x, left_wrist.y),
             (left_shoulder.x, left_shoulder.y),
             state.left_elbow_angle,
-        ) {
-            state.left_depth = result.depth_percent;
-            state.left_depth_valid = result.is_valid_punch_vector;
-            state.left_direction_angle = result.direction_angle_deg;
-        }
-        if let Some(result) = state.depth_estimator.calculate_with_filter(
+        );
+        state.left_depth = left_result.gated_percent;
+        state.left_depth_valid = left_result.is_valid;
+        state.left_direction_angle = left_result.direction_angle;
+        
+        let right_result = state.depth_estimator.calculate_gated(
             (right_wrist.x, right_wrist.y),
             (right_shoulder.x, right_shoulder.y),
             state.right_elbow_angle,
-        ) {
-            state.right_depth = result.depth_percent;
-            state.right_depth_valid = result.is_valid_punch_vector;
-            state.right_direction_angle = result.direction_angle_deg;
-        }
+        );
+        state.right_depth = right_result.gated_percent;
+        state.right_depth_valid = right_result.is_valid;
+        state.right_direction_angle = right_result.direction_angle;
         
         // Store predicted positions
         state.predicted_wrists[0] = state.left_hand.kalman.position();
@@ -253,21 +260,144 @@ pub fn physics_tick(dt: f32) {
         state.timestamp += dt as f64;
         let t = state.timestamp;
         
-        // Kalman PREDICT step (120Hz physics)
-        state.left_hand.kalman.predict(dt);
-        state.right_hand.kalman.predict(dt);
+        // 120Hz Physics tick (fast path - pure x += vx*dt)
+        state.left_hand.kalman.tick(dt);
+        state.right_hand.kalman.tick(dt);
         
-        // Get Kalman predicted positions
+        // Get predicted positions
         let left_pred = state.left_hand.kalman.position();
         let right_pred = state.right_hand.kalman.position();
         state.predicted_wrists[0] = left_pred;
         state.predicted_wrists[1] = right_pred;
         
-        // Apply One Euro Filter for jitter reduction (AFTER Kalman)
+        // Apply One Euro Filter for jitter reduction
         state.smoothed_wrists[0] = state.left_hand.one_euro.filter(t, left_pred);
         state.smoothed_wrists[1] = state.right_hand.one_euro.filter(t, right_pred);
         
         state.frame_count += 1;
+    });
+}
+
+/// Apply soft MediaPipe correction (~30Hz) - doesn't replace, just nudges physics
+#[wasm_bindgen]
+pub fn apply_mediapipe_correction(data: &[f32]) {
+    if data.len() != 99 {
+        return;
+    }
+    
+    STATE.with(|state_cell| {
+        let mut state = state_cell.borrow_mut();
+        
+        // Extract raw wrist positions
+        let raw_left_wrist = (data[LEFT_WRIST * 3], data[LEFT_WRIST * 3 + 1]);
+        let raw_right_wrist = (data[RIGHT_WRIST * 3], data[RIGHT_WRIST * 3 + 1]);
+        
+        // Get predicted positions from Kalman
+        let pred_left = state.left_hand.kalman.position();
+        let pred_right = state.right_hand.kalman.position();
+        
+        // Get previous positions (smoothed wrists from last frame)
+        let prev_left = state.smoothed_wrists[0];
+        let prev_right = state.smoothed_wrists[1];
+        
+        // ====== LAYER 4: OUTLIER REJECTION ======
+        let (left_wrist, _left_rejected) = reject_outlier(raw_left_wrist, pred_left, prev_left);
+        let (right_wrist, _right_rejected) = reject_outlier(raw_right_wrist, pred_right, prev_right);
+        
+        // ====== LAYER 3: VELOCITY CLAMPING ======
+        let left_wrist = clamp_velocity(left_wrist, prev_left);
+        let right_wrist = clamp_velocity(right_wrist, prev_right);
+        
+        // Soft Kalman correction with constrained position
+        state.left_hand.kalman.correct(left_wrist.0, left_wrist.1);
+        state.right_hand.kalman.correct(right_wrist.0, right_wrist.1);
+        
+        // Store raw landmarks for angle/depth calculation
+        for i in 0..33 {
+            state.raw_landmarks[i] = Landmark {
+                x: data[i * 3],
+                y: data[i * 3 + 1],
+                z: data[i * 3 + 2],
+            };
+        }
+        state.has_data = true;
+        
+        // Update angles and depth (from raw landmarks)
+        let left_shoulder = state.raw_landmarks[LEFT_SHOULDER];
+        let left_elbow = state.raw_landmarks[LEFT_ELBOW];
+        let left_wrist = state.raw_landmarks[LEFT_WRIST];
+        let right_shoulder = state.raw_landmarks[RIGHT_SHOULDER];
+        let right_elbow = state.raw_landmarks[RIGHT_ELBOW];
+        let right_wrist = state.raw_landmarks[RIGHT_WRIST];
+        
+        // Calculate elbow angles
+        state.left_elbow_angle = calculate_elbow_angle(
+            (left_shoulder.x, left_shoulder.y),
+            (left_elbow.x, left_elbow.y),
+            (left_wrist.x, left_wrist.y),
+        );
+        state.right_elbow_angle = calculate_elbow_angle(
+            (right_shoulder.x, right_shoulder.y),
+            (right_elbow.x, right_elbow.y),
+            (right_wrist.x, right_wrist.y),
+        );
+        
+        // Calculate gated depth
+        let left_result = state.depth_estimator.calculate_gated(
+            (left_wrist.x, left_wrist.y),
+            (left_shoulder.x, left_shoulder.y),
+            state.left_elbow_angle,
+        );
+        state.left_depth = left_result.gated_percent;
+        state.left_depth_valid = left_result.is_valid;
+        
+        let right_result = state.depth_estimator.calculate_gated(
+            (right_wrist.x, right_wrist.y),
+            (right_shoulder.x, right_shoulder.y),
+            state.right_elbow_angle,
+        );
+        state.right_depth = right_result.gated_percent;
+        state.right_depth_valid = right_result.is_valid;
+        
+        // Update velocity trackers
+        state.left_velocity = state.left_hand.velocity.update((left_wrist.x, left_wrist.y));
+        state.right_velocity = state.right_hand.velocity.update((right_wrist.x, right_wrist.y));
+        
+        // Physics-based punch detection (replaces ONNX)
+        // Copy values to avoid borrow conflict
+        let left_vel = state.left_velocity;
+        let right_vel = state.right_velocity;
+        let left_d = state.left_depth;
+        let right_d = state.right_depth;
+        let left_valid = state.left_depth_valid;
+        let right_valid = state.right_depth_valid;
+        let right_dir_y = right_wrist.y - state.predicted_wrists[1].1;
+        
+        let (punch, confidence) = state.punch_detector.detect(
+            left_vel,
+            right_vel,
+            left_d,
+            right_d,
+            left_valid,
+            right_valid,
+            right_dir_y,
+        );
+        
+        if confidence > 0.5 && punch != PunchType::Idle {
+            state.last_punch = punch;
+            state.last_punch_confidence = confidence;
+            web_sys::console::log_1(&format!("🥊 {} ({:.0}%)", punch.name(), confidence * 100.0).into());
+        }
+        
+        // Push frame to classification buffer (kept for compatibility)
+        let left_v = state.left_velocity;
+        let right_v = state.right_velocity;
+        let raw_lm = state.raw_landmarks.clone();
+        super::classifier_integration::process_classification_frame(
+            &raw_lm,
+            left_v,
+            right_v,
+        );
     });
 }
 

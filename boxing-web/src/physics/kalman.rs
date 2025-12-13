@@ -114,6 +114,35 @@ impl KalmanFilter {
         self.state[5] *= 0.95;  // ay decay
     }
     
+    /// Fast tick for render loop (120Hz) - pure physics, no matrices
+    pub fn tick(&mut self, dt: f32) {
+        // Pure physics prediction
+        self.state[0] += self.state[2] * dt;  // x += vx * dt
+        self.state[1] += self.state[3] * dt;  // y += vy * dt
+        
+        // Light friction (prevents runaway)
+        self.state[2] *= 0.995;
+        self.state[3] *= 0.995;
+    }
+    
+    /// Soft correction when MediaPipe data arrives (~30Hz)
+    /// Uses configurable gain: 0.3 = trust physics 70%
+    pub fn correct(&mut self, measured_x: f32, measured_y: f32) {
+        let error_x = measured_x - self.state[0];
+        let error_y = measured_y - self.state[1];
+        
+        // Kalman gain (0.3 = balanced blend)
+        let k = 0.3;
+        
+        // Soft position correction
+        self.state[0] += k * error_x;
+        self.state[1] += k * error_y;
+        
+        // Update velocity estimate from correction (~30 corrections/sec)
+        self.state[2] += k * error_x * 30.0;
+        self.state[3] += k * error_y * 30.0;
+    }
+    
     /// Update step - called at 30Hz with MediaPipe measurement
     /// 
     /// Corrects prediction based on actual measurement
@@ -145,14 +174,32 @@ impl KalmanFilter {
         (self.state[0], self.state[1])
     }
     
-    /// Get estimated velocity
+    /// Get estimated velocity (vx, vy)
     pub fn velocity(&self) -> (f32, f32) {
         (self.state[2], self.state[3])
+    }
+    
+    /// Get velocity magnitude (normalized by shoulder width)
+    pub fn velocity_magnitude(&self, shoulder_width: f32) -> f32 {
+        let (vx, vy) = self.velocity();
+        let mag = (vx * vx + vy * vy).sqrt();
+        if shoulder_width > 0.001 { mag / shoulder_width } else { mag }
     }
     
     /// Get estimated acceleration
     pub fn acceleration(&self) -> (f32, f32) {
         (self.state[4], self.state[5])
+    }
+    
+    /// Predict-only mode (coasting) - use when measurement is bad
+    /// Continues physics prediction without correction
+    pub fn predict_only(&mut self, dt: f32) {
+        self.state[0] += self.state[2] * dt;
+        self.state[1] += self.state[3] * dt;
+        self.state[2] *= 0.98;
+        self.state[3] *= 0.98;
+        self.state[4] *= 0.95;
+        self.state[5] *= 0.95;
     }
     
     /// Initialize filter with first measurement
