@@ -8,9 +8,10 @@ use std::cell::RefCell;
 use crate::physics::{
     KalmanFilter, DepthEstimator, DepthResult, VelocityTracker, 
     calculate_elbow_angle, OneEuroFilter2D, KinematicConstraints,
-    PunchDetector, PunchType, Extrapolator, ConfidenceGate,
+    PunchDetector, PunchType, Extrapolator, ConfidenceGate, ArmIK,
     clamp_velocity, reject_outlier, clamp_elbow_angle,
 };
+use crate::renderer::update_arm_metrics;
 
 // ============================================================================
 // LANDMARK INDICES (MediaPipe Pose - 33 total)
@@ -90,6 +91,8 @@ struct PhysicsState {
     depth_estimator: DepthEstimator,
     left_constraints: KinematicConstraints,
     right_constraints: KinematicConstraints,
+    left_ik: ArmIK,
+    right_ik: ArmIK,
     punch_detector: PunchDetector,
     left_extrapolator: Extrapolator,
     right_extrapolator: Extrapolator,
@@ -122,6 +125,8 @@ impl Default for PhysicsState {
             depth_estimator: DepthEstimator::new(),
             left_constraints: KinematicConstraints::new(),
             right_constraints: KinematicConstraints::new(),
+            left_ik: ArmIK::new(false),  // Left arm
+            right_ik: ArmIK::new(true),  // Right arm
             punch_detector: PunchDetector::new(),
             left_extrapolator: Extrapolator::new(),
             right_extrapolator: Extrapolator::new(),
@@ -352,9 +357,59 @@ pub fn apply_mediapipe_correction(data: &[f32]) {
             (right_wrist.x, right_wrist.y),
         );
         
-        // Calculate gated depth
+        // ====== BONE LENGTH FIX (Direction-Preserving FK) ======
+        // Trusts MediaPipe direction but enforces exact calibrated bone lengths
+        // "Instead of recalculating... just fix the Bone Lengths"
+        let (use_left_elbow, use_left_wrist) = if state.left_ik.is_calibrated() {
+            state.left_ik.solve_fk(
+                (left_shoulder.x, left_shoulder.y),
+                (left_elbow.x, left_elbow.y),
+                (left_wrist.x, left_wrist.y),
+            )
+        } else {
+            // Not calibrated - use raw values
+            ((left_elbow.x, left_elbow.y), (left_wrist.x, left_wrist.y))
+        };
+        
+        let (use_right_elbow, use_right_wrist) = if state.right_ik.is_calibrated() {
+            state.right_ik.solve_fk(
+                (right_shoulder.x, right_shoulder.y),
+                (right_elbow.x, right_elbow.y),
+                (right_wrist.x, right_wrist.y),
+            )
+        } else {
+            // Not calibrated - use raw values
+            ((right_elbow.x, right_elbow.y), (right_wrist.x, right_wrist.y))
+        };
+        
+        // Store IK-solved positions for rendering (elbows directly from IK)
+        state.raw_landmarks[LEFT_ELBOW].x = use_left_elbow.0;
+        state.raw_landmarks[LEFT_ELBOW].y = use_left_elbow.1;
+        state.raw_landmarks[RIGHT_ELBOW].x = use_right_elbow.0;
+        state.raw_landmarks[RIGHT_ELBOW].y = use_right_elbow.1;
+        
+        // ====== LAYER 5: ONE EURO FILTER (smooth wrist jitter) ======
+        let timestamp = js_sys::Date::now() / 1000.0;  // Convert to seconds
+        let smooth_left_wrist = state.left_hand.one_euro.filter(timestamp, use_left_wrist);
+        let smooth_right_wrist = state.right_hand.one_euro.filter(timestamp, use_right_wrist);
+        
+        // ====== LAYER 6: KALMAN CORRECTION (final smooth + prediction) ======
+        state.left_hand.kalman.correct(smooth_left_wrist.0, smooth_left_wrist.1);
+        state.right_hand.kalman.correct(smooth_right_wrist.0, smooth_right_wrist.1);
+        
+        // Use Kalman-smoothed positions for final output
+        let final_left_wrist = state.left_hand.kalman.position();
+        let final_right_wrist = state.right_hand.kalman.position();
+        
+        // Store final wrist positions for rendering
+        state.raw_landmarks[LEFT_WRIST].x = final_left_wrist.0;
+        state.raw_landmarks[LEFT_WRIST].y = final_left_wrist.1;
+        state.raw_landmarks[RIGHT_WRIST].x = final_right_wrist.0;
+        state.raw_landmarks[RIGHT_WRIST].y = final_right_wrist.1;
+        
+        // Calculate gated depth (using final wrist positions)
         let left_result = state.depth_estimator.calculate_gated(
-            (left_wrist.x, left_wrist.y),
+            final_left_wrist,
             (left_shoulder.x, left_shoulder.y),
             state.left_elbow_angle,
         );
@@ -362,21 +417,24 @@ pub fn apply_mediapipe_correction(data: &[f32]) {
         state.left_depth_valid = left_result.is_valid;
         
         let right_result = state.depth_estimator.calculate_gated(
-            (right_wrist.x, right_wrist.y),
+            final_right_wrist,
             (right_shoulder.x, right_shoulder.y),
             state.right_elbow_angle,
         );
         state.right_depth = right_result.gated_percent;
         state.right_depth_valid = right_result.is_valid;
         
-        // Update velocity trackers
-        state.left_velocity = state.left_hand.velocity.update((left_wrist.x, left_wrist.y));
-        state.right_velocity = state.right_hand.velocity.update((right_wrist.x, right_wrist.y));
+        // Update velocity trackers (using final wrist positions)
+        state.left_velocity = state.left_hand.velocity.update(final_left_wrist);
+        state.right_velocity = state.right_hand.velocity.update(final_right_wrist);
         
         // Update extrapolators for latency compensation
         let now = js_sys::Date::now();
-        state.left_extrapolator.update((left_wrist.x, left_wrist.y), now);
-        state.right_extrapolator.update((right_wrist.x, right_wrist.y), now);
+        state.left_extrapolator.update(final_left_wrist, now);
+        state.right_extrapolator.update(final_right_wrist, now);
+        
+        // Store final wrists for smoothed rendering
+        state.smoothed_wrists = [final_left_wrist, final_right_wrist];
         
         // Physics-based punch detection (replaces ONNX)
         // Copy values to avoid borrow conflict
@@ -403,6 +461,12 @@ pub fn apply_mediapipe_correction(data: &[f32]) {
             state.last_punch_confidence = confidence;
             web_sys::console::log_1(&format!("🥊 {} ({:.0}%)", punch.name(), confidence * 100.0).into());
         }
+        
+        // Update debug overlay with current physics values
+        update_arm_metrics(
+            left_d, state.left_elbow_angle, left_vel, left_valid,
+            right_d, state.right_elbow_angle, right_vel, right_valid,
+        );
         
         // Push frame to classification buffer (kept for compatibility)
         let left_v = state.left_velocity;
@@ -442,9 +506,13 @@ pub fn calibrate_depth() {
         // Calibrate depth estimator (with full context)
         state.depth_estimator.calibrate(left_shoulder, right_shoulder, left_wrist, left_shoulder);
         
-        // Calibrate kinematic constraints for both arms
+        // Calibrate kinematic constraints for both arms (FK fallback)
         state.left_constraints.calibrate(left_shoulder, left_elbow, left_wrist, shoulder_width);
         state.right_constraints.calibrate(right_shoulder, right_elbow, right_wrist, shoulder_width);
+        
+        // Calibrate IK solvers - these use only bone lengths from T-pose
+        state.left_ik.calibrate(left_shoulder, left_elbow, left_wrist);
+        state.right_ik.calibrate(right_shoulder, right_elbow, right_wrist);
         
         web_sys::console::log_1(&format!(
             "✅ Calibrated: shoulder_width={:.3}", shoulder_width

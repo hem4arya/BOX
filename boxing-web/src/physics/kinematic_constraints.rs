@@ -65,6 +65,10 @@ impl KinematicConstraints {
             None => return (raw_elbow, raw_wrist),
         };
         
+        // Calculate current bone lengths (for comparison in debug log)
+        let current_upper = Self::distance(shoulder, raw_elbow);
+        let current_fore = Self::distance(raw_elbow, raw_wrist);
+        
         // Step 1: Correct elbow - keep direction, force length
         let elbow_dir = Self::normalize(
             raw_elbow.0 - shoulder.0,
@@ -84,6 +88,24 @@ impl KinematicConstraints {
             corrected_elbow.0 + wrist_dir.0 * fore_len,
             corrected_elbow.1 + wrist_dir.1 * fore_len,
         );
+        
+        // Verify corrected lengths
+        let corrected_upper = Self::distance(shoulder, corrected_elbow);
+        let corrected_fore = Self::distance(corrected_elbow, corrected_wrist);
+        
+        // DEBUG: Log BOTH input and output bone lengths
+        static mut FRAME: u32 = 0;
+        unsafe {
+            FRAME += 1;
+            if FRAME % 60 == 0 {
+                web_sys::console::log_1(&format!(
+                    "🦴 Bones: target={:.3}/{:.3} | raw={:.3}/{:.3} | corrected={:.3}/{:.3}",
+                    upper_len, fore_len, 
+                    current_upper, current_fore,
+                    corrected_upper, corrected_fore
+                ).into());
+            }
+        }
         
         (corrected_elbow, corrected_wrist)
     }

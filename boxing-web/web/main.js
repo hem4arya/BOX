@@ -15,6 +15,7 @@ import init, {
   set_frame_metrics,
   set_mediapipe_latency,
   set_physics_time,
+  get_debug_overlay_text,
 } from "../pkg/boxing_web.js";
 
 // ============================================================================
@@ -31,6 +32,7 @@ class StatsMonitor {
     this.physicsMs = 0;
     this.frameMs = 0;
     this.cameraLatency = 0;
+    this.armInfo = "";
 
     this.div = document.createElement("div");
     this.div.style.cssText = `
@@ -90,6 +92,13 @@ class StatsMonitor {
         : "#00ff00";
     const camColor = this.cameraLatency > 50 ? "#ff4444" : "#00ff00";
 
+    // Get arm debug info from WASM
+    try {
+      this.armInfo = get_debug_overlay_text();
+    } catch (e) {
+      this.armInfo = "";
+    }
+
     this.div.innerHTML = `
       <b>FPS:</b> ${this.fps}<br>
       <b>Frame:</b> <span style="color:${frameColor}">${this.frameMs.toFixed(
@@ -102,6 +111,7 @@ class StatsMonitor {
       0
     )}ms</span><br>
       <b>Physics:</b> ${this.physicsMs.toFixed(2)}ms<br>
+      <span style="color:#0ff">${this.armInfo.replace(/\n/g, "<br>")}</span><br>
       <span style="color:#888">VideoFrame API ✓</span>
     `;
   }

@@ -12,6 +12,7 @@ mod kinematic_constraints;
 mod detection;
 mod extrapolation;
 mod confidence_gate;
+mod arm_ik;
 
 pub use state::HandState;
 pub use kalman::KalmanFilter;
@@ -23,3 +24,4 @@ pub use kinematic_constraints::{KinematicConstraints, clamp_velocity, reject_out
 pub use detection::{PunchDetector, PunchType};
 pub use extrapolation::Extrapolator;
 pub use confidence_gate::ConfidenceGate;
+pub use arm_ik::ArmIK;

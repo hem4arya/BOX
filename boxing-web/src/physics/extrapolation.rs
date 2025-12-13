@@ -66,22 +66,6 @@ impl Extrapolator {
         // Total latency = time since capture + system latency
         let total_latency = time_since_capture + self.system_latency;
         
-        // DEBUG: Log every 30th call
-        static mut DEBUG_COUNTER: u32 = 0;
-        unsafe {
-            DEBUG_COUNTER += 1;
-            if DEBUG_COUNTER % 30 == 0 {
-                let offset_x = self.velocity.0 * total_latency * self.overshoot;
-                let offset_y = self.velocity.1 * total_latency * self.overshoot;
-                web_sys::console::log_1(&format!(
-                    "🔮 Extrap: dt={:.0}ms, total_lat={:.0}ms, vel=({:.5},{:.5}), offset=({:.4},{:.4})",
-                    time_since_capture, total_latency, 
-                    self.velocity.0, self.velocity.1,
-                    offset_x, offset_y
-                ).into());
-            }
-        }
-        
         // Predict ahead with overshoot
         (
             self.last_pos.0 + self.velocity.0 * total_latency * self.overshoot,

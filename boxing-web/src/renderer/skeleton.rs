@@ -138,19 +138,6 @@ pub fn render_frame() {
         if extrap.len() == 4 {
             let left = (extrap[0], extrap[1]);
             let right = (extrap[2], extrap[3]);
-            
-            // DEBUG: Log extrapolated positions periodically
-            static mut FRAME: u32 = 0;
-            unsafe {
-                FRAME += 1;
-                if FRAME % 60 == 0 {
-                    web_sys::console::log_1(&format!(
-                        "🎯 Extrap wrists: L=({:.3},{:.3}) R=({:.3},{:.3})",
-                        left.0, left.1, right.0, right.1
-                    ).into());
-                }
-            }
-            
             vertices.extend(build_smoothed_vertices([left, right]));
         }
 
