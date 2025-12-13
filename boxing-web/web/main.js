@@ -253,8 +253,11 @@ async function main() {
   // ========================================================================
   const videoTrack = stream.getVideoTracks()[0];
 
+  // EXPERIMENT: Force video element instead of VideoFrame API
+  const USE_VIDEO_ELEMENT = true;
+
   // Check if VideoFrame API is supported
-  if (typeof MediaStreamTrackProcessor !== "undefined") {
+  if (!USE_VIDEO_ELEMENT && typeof MediaStreamTrackProcessor !== "undefined") {
     console.log("🎬 Using VideoFrame API (zero-buffering)");
 
     const trackProcessor = new MediaStreamTrackProcessor({ track: videoTrack });
@@ -301,8 +304,8 @@ async function main() {
     lastRenderTime = performance.now();
     requestAnimationFrame(renderLoop);
   } else {
-    // Fallback: Use video element (older browsers)
-    console.log("⚠️ VideoFrame API not supported, using <video> fallback");
+    // Using video element (experiment or fallback)
+    console.log("🎥 Using <video> element for MediaPipe detection");
 
     async function detectionLoop() {
       while (true) {

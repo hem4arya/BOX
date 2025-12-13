@@ -6,13 +6,13 @@
 const CAMERA_LATENCY: f32 = 33.0;   // Camera capture time
 const PIPELINE_LATENCY: f32 = 20.0; // USB/Browser overhead
 const MEDIAPIPE_LATENCY: f32 = 25.0; // Inference time
-const TOTAL_SYSTEM_LATENCY: f32 = CAMERA_LATENCY + PIPELINE_LATENCY + MEDIAPIPE_LATENCY;
+const TOTAL_SYSTEM_LATENCY: f32 = 90.0; // Tuned for "Aggressive" latency compensation
 
 /// Overshoot factor (1.1 = predict 10% further for snappier feel)
 const OVERSHOOT: f32 = 1.1;
 
-/// Velocity smoothing factor (0.3 = 30% new, 70% old)
-const VELOCITY_ALPHA: f32 = 0.3;
+/// Velocity smoothing factor (0.7 = 70% new, 30% old - very responsive)
+const VELOCITY_ALPHA: f32 = 0.7;
 
 /// Extrapolator predicts position ahead based on velocity
 pub struct Extrapolator {

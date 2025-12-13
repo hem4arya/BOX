@@ -357,53 +357,52 @@ pub fn apply_mediapipe_correction(data: &[f32]) {
             (right_wrist.x, right_wrist.y),
         );
         
-        // ====== BONE LENGTH FIX (Direction-Preserving FK) ======
-        // Trusts MediaPipe direction but enforces exact calibrated bone lengths
-        // "Instead of recalculating... just fix the Bone Lengths"
-        let (use_left_elbow, use_left_wrist) = if state.left_ik.is_calibrated() {
-            state.left_ik.solve_fk(
-                (left_shoulder.x, left_shoulder.y),
-                (left_elbow.x, left_elbow.y),
-                (left_wrist.x, left_wrist.y),
-            )
-        } else {
-            // Not calibrated - use raw values
-            ((left_elbow.x, left_elbow.y), (left_wrist.x, left_wrist.y))
-        };
-        
-        let (use_right_elbow, use_right_wrist) = if state.right_ik.is_calibrated() {
-            state.right_ik.solve_fk(
-                (right_shoulder.x, right_shoulder.y),
-                (right_elbow.x, right_elbow.y),
-                (right_wrist.x, right_wrist.y),
-            )
-        } else {
-            // Not calibrated - use raw values
-            ((right_elbow.x, right_elbow.y), (right_wrist.x, right_wrist.y))
-        };
-        
-        // Store IK-solved positions for rendering (elbows directly from IK)
-        state.raw_landmarks[LEFT_ELBOW].x = use_left_elbow.0;
-        state.raw_landmarks[LEFT_ELBOW].y = use_left_elbow.1;
-        state.raw_landmarks[RIGHT_ELBOW].x = use_right_elbow.0;
-        state.raw_landmarks[RIGHT_ELBOW].y = use_right_elbow.1;
-        
         // ====== LAYER 5: ONE EURO FILTER (smooth wrist jitter) ======
+        // Apply to RAW positions first (before bone fix)
         let timestamp = js_sys::Date::now() / 1000.0;  // Convert to seconds
-        let smooth_left_wrist = state.left_hand.one_euro.filter(timestamp, use_left_wrist);
-        let smooth_right_wrist = state.right_hand.one_euro.filter(timestamp, use_right_wrist);
+        let smooth_left_wrist = state.left_hand.one_euro.filter(timestamp, (left_wrist.x, left_wrist.y));
+        let smooth_right_wrist = state.right_hand.one_euro.filter(timestamp, (right_wrist.x, right_wrist.y));
+        let smooth_left_elbow = (left_elbow.x, left_elbow.y); // Elbows don't need smoothing (less jitter)
+        let smooth_right_elbow = (right_elbow.x, right_elbow.y);
         
         // ====== LAYER 6: KALMAN CORRECTION (final smooth + prediction) ======
         state.left_hand.kalman.correct(smooth_left_wrist.0, smooth_left_wrist.1);
         state.right_hand.kalman.correct(smooth_right_wrist.0, smooth_right_wrist.1);
         
-        // Use Kalman-smoothed positions for final output
-        let final_left_wrist = state.left_hand.kalman.position();
-        let final_right_wrist = state.right_hand.kalman.position();
+        // Use Kalman-smoothed positions
+        let kalman_left_wrist = state.left_hand.kalman.position();
+        let kalman_right_wrist = state.right_hand.kalman.position();
         
-        // Store final wrist positions for rendering
+        // ====== LAYER 7: BONE LENGTH FIX (FINAL - after all filtering) ======
+        // NOW apply bone constraints to the filtered positions
+        // This ensures bone lengths are ALWAYS exact, even after smoothing
+        let (final_left_elbow, final_left_wrist) = if state.left_ik.is_calibrated() {
+            state.left_ik.solve_fk(
+                (left_shoulder.x, left_shoulder.y),
+                smooth_left_elbow,
+                kalman_left_wrist,
+            )
+        } else {
+            (smooth_left_elbow, kalman_left_wrist)
+        };
+        
+        let (final_right_elbow, final_right_wrist) = if state.right_ik.is_calibrated() {
+            state.right_ik.solve_fk(
+                (right_shoulder.x, right_shoulder.y),
+                smooth_right_elbow,
+                kalman_right_wrist,
+            )
+        } else {
+            (smooth_right_elbow, kalman_right_wrist)
+        };
+        
+        // Store FINAL positions (bone-constrained) for rendering
+        state.raw_landmarks[LEFT_ELBOW].x = final_left_elbow.0;
+        state.raw_landmarks[LEFT_ELBOW].y = final_left_elbow.1;
         state.raw_landmarks[LEFT_WRIST].x = final_left_wrist.0;
         state.raw_landmarks[LEFT_WRIST].y = final_left_wrist.1;
+        state.raw_landmarks[RIGHT_ELBOW].x = final_right_elbow.0;
+        state.raw_landmarks[RIGHT_ELBOW].y = final_right_elbow.1;
         state.raw_landmarks[RIGHT_WRIST].x = final_right_wrist.0;
         state.raw_landmarks[RIGHT_WRIST].y = final_right_wrist.1;
         
@@ -436,6 +435,19 @@ pub fn apply_mediapipe_correction(data: &[f32]) {
         // Store final wrists for smoothed rendering
         state.smoothed_wrists = [final_left_wrist, final_right_wrist];
         
+        // ====== RECALCULATE ELBOW ANGLES (using FINAL bone-constrained positions) ======
+        // This ensures the debug overlay shows the correct angles for the rendered skeleton
+        state.left_elbow_angle = calculate_elbow_angle(
+            (left_shoulder.x, left_shoulder.y),
+            final_left_elbow,
+            final_left_wrist,
+        );
+        state.right_elbow_angle = calculate_elbow_angle(
+            (right_shoulder.x, right_shoulder.y),
+            final_right_elbow,
+            final_right_wrist,
+        );
+        
         // Physics-based punch detection (replaces ONNX)
         // Copy values to avoid borrow conflict
         let left_vel = state.left_velocity;
@@ -462,7 +474,7 @@ pub fn apply_mediapipe_correction(data: &[f32]) {
             web_sys::console::log_1(&format!("🥊 {} ({:.0}%)", punch.name(), confidence * 100.0).into());
         }
         
-        // Update debug overlay with current physics values
+        // Update debug overlay with FINAL physics values (after all filtering and constraints)
         update_arm_metrics(
             left_d, state.left_elbow_angle, left_vel, left_valid,
             right_d, state.right_elbow_angle, right_vel, right_valid,
