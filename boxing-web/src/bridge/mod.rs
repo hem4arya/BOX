@@ -12,6 +12,9 @@ pub use landmarks::{
     physics_tick,
     calibrate_depth,
     apply_mediapipe_correction,
+    get_extrapolated_wrists,
+    get_raw_wrists,
+    set_extrapolation_params,
     // Internal API
     get_all_landmarks, 
     get_predicted_wrists,

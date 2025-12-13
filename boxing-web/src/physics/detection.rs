@@ -43,9 +43,9 @@ pub struct PunchDetector {
 impl PunchDetector {
     pub fn new() -> Self {
         Self {
-            velocity_threshold: 0.08,
-            depth_threshold: 25.0,
-            cooldown: 15, // ~0.5s at 30Hz
+            velocity_threshold: 0.15,  // Raised from 0.08
+            depth_threshold: 30.0,     // Raised from 25.0
+            cooldown: 30,              // Raised from 15 (~1s at 30Hz)
             cooldown_counter: 0,
             last_punch: PunchType::Idle,
             last_confidence: 0.0,
@@ -106,15 +106,11 @@ impl PunchDetector {
             }
         }
         
-        // HOOK: Right hand lateral (not forward, but fast)
-        if right_velocity > self.velocity_threshold && !right_valid && right_depth < 20.0 {
-            let vel_score = (right_velocity / 0.15).min(1.0);
-            let hook_conf = vel_score * 0.8;
-            if hook_conf > confidence {
-                punch = PunchType::Hook;
-                confidence = hook_conf;
-            }
-        }
+        // HOOK: DISABLED - too many false positives
+        // TODO: Implement proper lateral movement detection
+        // if right_velocity > 0.20 && !right_valid && right_depth < 20.0 {
+        //     ...
+        // }
         
         // Apply cooldown if punch detected
         if punch != PunchType::Idle && confidence > 0.5 {

@@ -133,9 +133,25 @@ pub fn render_frame() {
             vertices.extend(build_depth_bar(right_wrist, right_depth, right_valid, true));
         }
         
-        // Draw smoothed wrists (jitter-free)
-        if let Some(smoothed) = bridge::get_smoothed_wrists() {
-            vertices.extend(build_smoothed_vertices(smoothed));
+        // Draw EXTRAPOLATED wrists (latency-compensated, predicts ahead)
+        let extrap = bridge::get_extrapolated_wrists();
+        if extrap.len() == 4 {
+            let left = (extrap[0], extrap[1]);
+            let right = (extrap[2], extrap[3]);
+            
+            // DEBUG: Log extrapolated positions periodically
+            static mut FRAME: u32 = 0;
+            unsafe {
+                FRAME += 1;
+                if FRAME % 60 == 0 {
+                    web_sys::console::log_1(&format!(
+                        "🎯 Extrap wrists: L=({:.3},{:.3}) R=({:.3},{:.3})",
+                        left.0, left.1, right.0, right.1
+                    ).into());
+                }
+            }
+            
+            vertices.extend(build_smoothed_vertices([left, right]));
         }
 
         let output = match state.surface.get_current_texture() {

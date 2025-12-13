@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use crate::physics::{
     KalmanFilter, DepthEstimator, DepthResult, VelocityTracker, 
     calculate_elbow_angle, OneEuroFilter2D, KinematicConstraints,
-    PunchDetector, PunchType,
+    PunchDetector, PunchType, Extrapolator, ConfidenceGate,
     clamp_velocity, reject_outlier, clamp_elbow_angle,
 };
 
@@ -60,6 +60,9 @@ struct HandPhysics {
     kalman: KalmanFilter,
     velocity: VelocityTracker,
     one_euro: OneEuroFilter2D,
+    elbow_gate: ConfidenceGate,
+    wrist_gate: ConfidenceGate,
+    last_wrist: (f32, f32),
     initialized: bool,
 }
 
@@ -69,6 +72,9 @@ impl Default for HandPhysics {
             kalman: KalmanFilter::new(),
             velocity: VelocityTracker::new(),
             one_euro: OneEuroFilter2D::new(),
+            elbow_gate: ConfidenceGate::new(),
+            wrist_gate: ConfidenceGate::new(),
+            last_wrist: (0.5, 0.5),
             initialized: false,
         }
     }
@@ -85,6 +91,8 @@ struct PhysicsState {
     left_constraints: KinematicConstraints,
     right_constraints: KinematicConstraints,
     punch_detector: PunchDetector,
+    left_extrapolator: Extrapolator,
+    right_extrapolator: Extrapolator,
     last_punch: PunchType,
     last_punch_confidence: f32,
     has_data: bool,
@@ -115,6 +123,8 @@ impl Default for PhysicsState {
             left_constraints: KinematicConstraints::new(),
             right_constraints: KinematicConstraints::new(),
             punch_detector: PunchDetector::new(),
+            left_extrapolator: Extrapolator::new(),
+            right_extrapolator: Extrapolator::new(),
             last_punch: PunchType::Idle,
             last_punch_confidence: 0.0,
             has_data: false,
@@ -363,6 +373,11 @@ pub fn apply_mediapipe_correction(data: &[f32]) {
         state.left_velocity = state.left_hand.velocity.update((left_wrist.x, left_wrist.y));
         state.right_velocity = state.right_hand.velocity.update((right_wrist.x, right_wrist.y));
         
+        // Update extrapolators for latency compensation
+        let now = js_sys::Date::now();
+        state.left_extrapolator.update((left_wrist.x, left_wrist.y), now);
+        state.right_extrapolator.update((right_wrist.x, right_wrist.y), now);
+        
         // Physics-based punch detection (replaces ONNX)
         // Copy values to avoid borrow conflict
         let left_vel = state.left_velocity;
@@ -504,3 +519,46 @@ pub fn get_smoothed_wrists() -> Option<[(f32, f32); 2]> {
         }
     })
 }
+
+/// Get extrapolated wrist positions (predicted ahead to compensate for latency)
+/// Returns [left_x, left_y, right_x, right_y]
+#[wasm_bindgen]
+pub fn get_extrapolated_wrists() -> Vec<f32> {
+    STATE.with(|state_cell| {
+        let state = state_cell.borrow();
+        let now = js_sys::Date::now();
+        
+        let left = state.left_extrapolator.predict(now);
+        let right = state.right_extrapolator.predict(now);
+        
+        vec![left.0, left.1, right.0, right.1]
+    })
+}
+
+/// Get raw wrist positions (no extrapolation, for comparison)
+/// Returns [left_x, left_y, right_x, right_y]
+#[wasm_bindgen]
+pub fn get_raw_wrists() -> Vec<f32> {
+    STATE.with(|state_cell| {
+        let state = state_cell.borrow();
+        
+        let left = state.left_extrapolator.raw_position();
+        let right = state.right_extrapolator.raw_position();
+        
+        vec![left.0, left.1, right.0, right.1]
+    })
+}
+
+/// Set extrapolation parameters (for tuning)
+#[wasm_bindgen]
+pub fn set_extrapolation_params(latency_ms: f32, overshoot: f32) {
+    STATE.with(|state_cell| {
+        let mut state = state_cell.borrow_mut();
+        state.left_extrapolator.set_latency(latency_ms);
+        state.left_extrapolator.set_overshoot(overshoot);
+        state.right_extrapolator.set_latency(latency_ms);
+        state.right_extrapolator.set_overshoot(overshoot);
+        web_sys::console::log_1(&format!("⚡ Extrapolation: latency={}ms, overshoot={}x", latency_ms, overshoot).into());
+    });
+}
+

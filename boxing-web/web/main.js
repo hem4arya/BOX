@@ -27,13 +27,11 @@ class StatsMonitor {
     this.frameCount = 0;
     this.lastFpsUpdate = 0;
     this.startTime = 0;
-
-    // Timing metrics
     this.mediapipeMs = 0;
     this.physicsMs = 0;
     this.frameMs = 0;
+    this.cameraLatency = 0;
 
-    // Create HUD overlay
     this.div = document.createElement("div");
     this.div.style.cssText = `
       position: fixed;
@@ -46,7 +44,7 @@ class StatsMonitor {
       padding: 10px 14px;
       border-radius: 6px;
       z-index: 9999;
-      min-width: 180px;
+      min-width: 200px;
       line-height: 1.5;
       border: 1px solid #333;
     `;
@@ -60,7 +58,6 @@ class StatsMonitor {
   end() {
     const now = performance.now();
     this.frameMs = now - this.startTime;
-
     this.frameCount++;
     if (now - this.lastFpsUpdate >= 500) {
       this.fps = Math.round(
@@ -78,6 +75,9 @@ class StatsMonitor {
   setPhysics(ms) {
     this.physicsMs = this.physicsMs * 0.8 + ms * 0.2;
   }
+  setCameraLatency(ms) {
+    this.cameraLatency = this.cameraLatency * 0.9 + ms * 0.1;
+  }
 
   updateDisplay() {
     const frameColor =
@@ -88,17 +88,21 @@ class StatsMonitor {
         : this.mediapipeMs > 25
         ? "#ffaa00"
         : "#00ff00";
+    const camColor = this.cameraLatency > 50 ? "#ff4444" : "#00ff00";
 
     this.div.innerHTML = `
       <b>FPS:</b> ${this.fps}<br>
       <b>Frame:</b> <span style="color:${frameColor}">${this.frameMs.toFixed(
       1
     )}ms</span><br>
+      <b>Camera:</b> <span style="color:${camColor}">${this.cameraLatency.toFixed(
+      0
+    )}ms</span><br>
       <b>MediaPipe:</b> <span style="color:${mpColor}">${this.mediapipeMs.toFixed(
       0
     )}ms</span><br>
       <b>Physics:</b> ${this.physicsMs.toFixed(2)}ms<br>
-      <span style="color:#888">Punch detection: Rust</span>
+      <span style="color:#888">VideoFrame API ✓</span>
     `;
   }
 }
@@ -112,6 +116,7 @@ const video = document.getElementById("camera-video");
 const stats = new StatsMonitor();
 
 let lastRenderTime = 0;
+let poseLandmarker = null;
 
 // Calibration
 let calibrationCountdown = 0;
@@ -140,24 +145,53 @@ async function main() {
   await wasmInit();
   console.log("🥊 Boxing Web WASM loaded");
 
-  // ONNX DISABLED - Using physics-based punch detection in Rust
-  console.log("ℹ️ Punch detection: Physics-based (Rust)");
-
-  status.textContent = "Requesting camera...";
+  // ========================================================================
+  // TIER 1 FIX #1: LOW-LATENCY CAMERA CONSTRAINTS
+  // ========================================================================
+  status.textContent = "Requesting camera (low-latency mode)...";
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: {
-        width: { ideal: 640 },
-        height: { ideal: 480 },
+        width: { ideal: 640, max: 640 },
+        height: { ideal: 360, max: 360 }, // Lower res = faster
+        frameRate: { ideal: 30, max: 30 },
         facingMode: "user",
+        // Low-latency hints (browser may ignore)
+        latency: { ideal: 0 },
+        resizeMode: "none",
       },
+      audio: false,
     });
+
+    // Disable auto-adjustments that cause delays
+    const track = stream.getVideoTracks()[0];
+    const capabilities = track.getCapabilities?.() || {};
+    const constraints = {};
+
+    if (capabilities.exposureMode?.includes("manual")) {
+      constraints.exposureMode = "manual";
+    }
+    if (capabilities.focusMode?.includes("manual")) {
+      constraints.focusMode = "manual";
+    }
+    if (capabilities.whiteBalanceMode?.includes("manual")) {
+      constraints.whiteBalanceMode = "manual";
+    }
+
+    if (Object.keys(constraints).length > 0) {
+      await track.applyConstraints({ advanced: [constraints] });
+      console.log("📷 Camera: manual mode applied", constraints);
+    }
+
+    console.log("📷 Camera: low-latency constraints applied");
   } catch (err) {
     status.textContent = "❌ Camera access denied";
+    console.error("Camera error:", err);
     return;
   }
 
+  // Keep video element for fallback/preview
   video.srcObject = stream;
   await video.play();
 
@@ -166,7 +200,7 @@ async function main() {
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
   );
 
-  const poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+  poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
     baseOptions: {
       modelAssetPath:
         "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
@@ -192,7 +226,6 @@ async function main() {
     const frameTime = timestamp - lastRenderTime;
     lastRenderTime = timestamp;
 
-    // Physics tick every frame (120Hz)
     const dt = Math.min(frameTime / 1000.0, 0.1);
     if (dt > 0.001) {
       const physicsStart = performance.now();
@@ -201,51 +234,101 @@ async function main() {
     }
 
     render_frame();
-
     stats.end();
     requestAnimationFrame(renderLoop);
   }
 
   // ========================================================================
-  // DETECTION LOOP (async) - Runs independently
+  // TIER 1 FIX #2: VIDEOFRAME API (Zero-buffering)
   // ========================================================================
-  async function detectionLoop() {
-    while (true) {
-      const mpStart = performance.now();
-      const results = poseLandmarker.detectForVideo(video, performance.now());
-      const mpTime = performance.now() - mpStart;
+  const videoTrack = stream.getVideoTracks()[0];
 
-      stats.setMediapipe(mpTime);
-      set_mediapipe_latency(mpTime);
+  // Check if VideoFrame API is supported
+  if (typeof MediaStreamTrackProcessor !== "undefined") {
+    console.log("🎬 Using VideoFrame API (zero-buffering)");
 
-      if (results.landmarks && results.landmarks[0]) {
-        const landmarks = results.landmarks[0];
-        const flatArray = new Float32Array(landmarks.length * 3);
-        landmarks.forEach((lm, i) => {
-          flatArray[i * 3] = lm.x;
-          flatArray[i * 3 + 1] = lm.y;
-          flatArray[i * 3 + 2] = lm.z;
-        });
+    const trackProcessor = new MediaStreamTrackProcessor({ track: videoTrack });
+    const reader = trackProcessor.readable.getReader();
 
-        // Punch detection happens in Rust (apply_mediapipe_correction)
-        apply_mediapipe_correction(flatArray);
+    async function processVideoFrames() {
+      while (true) {
+        try {
+          const { value: frame, done } = await reader.read();
+          if (done) break;
+
+          // Calculate camera-to-process latency
+          const captureTime = frame.timestamp / 1000; // microseconds to ms
+          const now = performance.now();
+          stats.setCameraLatency(now - captureTime);
+
+          // Run MediaPipe on raw frame (no video element buffering!)
+          const mpStart = performance.now();
+          const results = poseLandmarker.detectForVideo(frame, now);
+          stats.setMediapipe(performance.now() - mpStart);
+          set_mediapipe_latency(performance.now() - mpStart);
+
+          // CRITICAL: Close frame to release memory
+          frame.close();
+
+          if (results.landmarks && results.landmarks[0]) {
+            const landmarks = results.landmarks[0];
+            const flatArray = new Float32Array(landmarks.length * 3);
+            landmarks.forEach((lm, i) => {
+              flatArray[i * 3] = lm.x;
+              flatArray[i * 3 + 1] = lm.y;
+              flatArray[i * 3 + 2] = lm.z;
+            });
+            apply_mediapipe_correction(flatArray);
+          }
+        } catch (err) {
+          console.error("VideoFrame error:", err);
+          break;
+        }
       }
-
-      await new Promise((r) => setTimeout(r, 0));
     }
-  }
 
-  // Start both loops
-  video.addEventListener("loadeddata", () => {
+    processVideoFrames();
     lastRenderTime = performance.now();
     requestAnimationFrame(renderLoop);
-    detectionLoop();
-  });
+  } else {
+    // Fallback: Use video element (older browsers)
+    console.log("⚠️ VideoFrame API not supported, using <video> fallback");
 
-  if (video.readyState >= 2) {
-    lastRenderTime = performance.now();
-    requestAnimationFrame(renderLoop);
-    detectionLoop();
+    async function detectionLoop() {
+      while (true) {
+        const mpStart = performance.now();
+        const results = poseLandmarker.detectForVideo(video, performance.now());
+        const mpTime = performance.now() - mpStart;
+
+        stats.setMediapipe(mpTime);
+        set_mediapipe_latency(mpTime);
+
+        if (results.landmarks && results.landmarks[0]) {
+          const landmarks = results.landmarks[0];
+          const flatArray = new Float32Array(landmarks.length * 3);
+          landmarks.forEach((lm, i) => {
+            flatArray[i * 3] = lm.x;
+            flatArray[i * 3 + 1] = lm.y;
+            flatArray[i * 3 + 2] = lm.z;
+          });
+          apply_mediapipe_correction(flatArray);
+        }
+
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+
+    video.addEventListener("loadeddata", () => {
+      lastRenderTime = performance.now();
+      requestAnimationFrame(renderLoop);
+      detectionLoop();
+    });
+
+    if (video.readyState >= 2) {
+      lastRenderTime = performance.now();
+      requestAnimationFrame(renderLoop);
+      detectionLoop();
+    }
   }
 }
 
