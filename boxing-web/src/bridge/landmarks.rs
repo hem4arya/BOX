@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use crate::physics::{
     KalmanFilter, DepthEstimator, DepthResult, VelocityTracker, 
     calculate_elbow_angle, OneEuroFilter2D, KinematicConstraints,
-    PunchDetector, PunchType, Extrapolator, ConfidenceGate, ArmIK,
+    PunchDetector, PunchType, LinearPredictor, ConfidenceGate, ArmIK,
     clamp_velocity, reject_outlier, clamp_elbow_angle,
 };
 use crate::renderer::update_arm_metrics;
@@ -94,8 +94,8 @@ struct PhysicsState {
     left_ik: ArmIK,
     right_ik: ArmIK,
     punch_detector: PunchDetector,
-    left_extrapolator: Extrapolator,
-    right_extrapolator: Extrapolator,
+    left_predictor: LinearPredictor,
+    right_predictor: LinearPredictor,
     last_punch: PunchType,
     last_punch_confidence: f32,
     has_data: bool,
@@ -128,8 +128,8 @@ impl Default for PhysicsState {
             left_ik: ArmIK::new(false),  // Left arm
             right_ik: ArmIK::new(true),  // Right arm
             punch_detector: PunchDetector::new(),
-            left_extrapolator: Extrapolator::new(),
-            right_extrapolator: Extrapolator::new(),
+            left_predictor: LinearPredictor::new(),
+            right_predictor: LinearPredictor::new(),
             last_punch: PunchType::Idle,
             last_punch_confidence: 0.0,
             has_data: false,
@@ -344,6 +344,12 @@ pub fn apply_mediapipe_correction(data: &[f32]) {
         let right_shoulder = state.raw_landmarks[RIGHT_SHOULDER];
         let right_elbow = state.raw_landmarks[RIGHT_ELBOW];
         let right_wrist = state.raw_landmarks[RIGHT_WRIST];
+
+        // [MOVED] Update Predictors FIRST (Raw Speed)
+        // This ensures we predict based on the latest raw signal, unmodified by filters
+        // LinearPredictor doesn't need timestamp, it assumes per-frame updates
+        state.left_predictor.update((left_wrist.x, left_wrist.y));
+        state.right_predictor.update((right_wrist.x, right_wrist.y));
         
         // Calculate elbow angles
         state.left_elbow_angle = calculate_elbow_angle(
@@ -357,43 +363,117 @@ pub fn apply_mediapipe_correction(data: &[f32]) {
             (right_wrist.x, right_wrist.y),
         );
         
-        // ====== LAYER 5: ONE EURO FILTER (smooth wrist jitter) ======
-        // Apply to RAW positions first (before bone fix)
-        let timestamp = js_sys::Date::now() / 1000.0;  // Convert to seconds
-        let smooth_left_wrist = state.left_hand.one_euro.filter(timestamp, (left_wrist.x, left_wrist.y));
-        let smooth_right_wrist = state.right_hand.one_euro.filter(timestamp, (right_wrist.x, right_wrist.y));
-        let smooth_left_elbow = (left_elbow.x, left_elbow.y); // Elbows don't need smoothing (less jitter)
+        // ====== LAYER 5: ONE EURO FILTER (DELETED) ======
+        // Removed to reduce latency. Feeding Raw -> Kalman directly.
+        let smooth_left_elbow = (left_elbow.x, left_elbow.y); 
         let smooth_right_elbow = (right_elbow.x, right_elbow.y);
         
         // ====== LAYER 6: KALMAN CORRECTION (final smooth + prediction) ======
-        state.left_hand.kalman.correct(smooth_left_wrist.0, smooth_left_wrist.1);
-        state.right_hand.kalman.correct(smooth_right_wrist.0, smooth_right_wrist.1);
+        // Now using RAW MediaPipe data directly (no pre-smoothing)
+        state.left_hand.kalman.correct(left_wrist.x, left_wrist.y);
+        state.right_hand.kalman.correct(right_wrist.x, right_wrist.y);
         
-        // Use Kalman-smoothed positions
-        let kalman_left_wrist = state.left_hand.kalman.position();
-        let kalman_right_wrist = state.right_hand.kalman.position();
+        // Use Kalman-smoothed positions (STILL UPDATING KALMAN for Velocity/Physics State)
+        let _kalman_left_wrist = state.left_hand.kalman.position();
+        let _kalman_right_wrist = state.right_hand.kalman.position();
+
+        // [NUCLEAR OPTION] Use HYPER-PREDICTED Position for Rendering
+        // Bypass Kalman lag completely. Feed the 'Future' directly to the Skeleton.
+        let target_left_wrist = state.left_predictor.predicted_pos;
+        let target_right_wrist = state.right_predictor.predicted_pos;
         
         // ====== LAYER 7: BONE LENGTH FIX (FINAL - after all filtering) ======
         // NOW apply bone constraints to the filtered positions
         // This ensures bone lengths are ALWAYS exact, even after smoothing
+        // ====== LAYER 7: BONE LENGTH FIX (FINAL - after all filtering) ======
+        // NOW apply bone constraints to the filtered positions
+        // This ensures bone lengths are ALWAYS exact, even after smoothing
+        // If uncalibrated, calculate "Dynamic Lengths" from the current raw frame to keep arm connected
+        
         let (final_left_elbow, final_left_wrist) = if state.left_ik.is_calibrated() {
             state.left_ik.solve_fk(
                 (left_shoulder.x, left_shoulder.y),
                 smooth_left_elbow,
-                kalman_left_wrist,
+                target_left_wrist,
             )
         } else {
-            (smooth_left_elbow, kalman_left_wrist)
+            // Uncalibrated? Use current raw lengths to constrain the prediction!
+            // This prevents "Elastic Man" effect when predicting 500ms ahead.
+            let raw_s = (left_shoulder.x, left_shoulder.y);
+            let raw_e = (left_elbow.x, left_elbow.y);
+            let raw_w = (left_wrist.x, left_wrist.y);
+            
+            // Measure current lengths
+            let dyn_upper = ((raw_e.0 - raw_s.0).powi(2) + (raw_e.1 - raw_s.1).powi(2)).sqrt();
+            let dyn_fore = ((raw_w.0 - raw_e.0).powi(2) + (raw_w.1 - raw_e.1).powi(2)).sqrt();
+            
+            // Check for zero length to avoid NaN
+            if dyn_upper < 0.001 || dyn_fore < 0.001 {
+               (smooth_left_elbow, target_left_wrist)
+            } else {
+               // Manually apply FK logic with dynamic lengths
+               // 1. Elbow (relative to shoulder)
+               let d_se_x = smooth_left_elbow.0 - raw_s.0;
+               let d_se_y = smooth_left_elbow.1 - raw_s.1;
+               let len_se = (d_se_x.powi(2) + d_se_y.powi(2)).sqrt();
+               let fixed_elbow = if len_se > 0.001 {
+                   (raw_s.0 + (d_se_x / len_se) * dyn_upper, raw_s.1 + (d_se_y / len_se) * dyn_upper)
+               } else {
+                   smooth_left_elbow
+               };
+               
+               // 2. Wrist (relative to fixed elbow, pointing at target)
+               let d_ew_x = target_left_wrist.0 - fixed_elbow.0;
+               let d_ew_y = target_left_wrist.1 - fixed_elbow.1;
+               let len_ew = (d_ew_x.powi(2) + d_ew_y.powi(2)).sqrt();
+               let fixed_wrist = if len_ew > 0.001 {
+                   (fixed_elbow.0 + (d_ew_x / len_ew) * dyn_fore, fixed_elbow.1 + (d_ew_y / len_ew) * dyn_fore)
+               } else {
+                   target_left_wrist
+               };
+               
+               (fixed_elbow, fixed_wrist)
+            }
         };
         
         let (final_right_elbow, final_right_wrist) = if state.right_ik.is_calibrated() {
             state.right_ik.solve_fk(
                 (right_shoulder.x, right_shoulder.y),
                 smooth_right_elbow,
-                kalman_right_wrist,
+                target_right_wrist,
             )
         } else {
-            (smooth_right_elbow, kalman_right_wrist)
+            // Dynamic constraint for right arm
+            let raw_s = (right_shoulder.x, right_shoulder.y);
+            let raw_e = (right_elbow.x, right_elbow.y);
+            let raw_w = (right_wrist.x, right_wrist.y);
+            
+            let dyn_upper = ((raw_e.0 - raw_s.0).powi(2) + (raw_e.1 - raw_s.1).powi(2)).sqrt();
+            let dyn_fore = ((raw_w.0 - raw_e.0).powi(2) + (raw_w.1 - raw_e.1).powi(2)).sqrt();
+            
+            if dyn_upper < 0.001 || dyn_fore < 0.001 {
+               (smooth_right_elbow, target_right_wrist)
+            } else {
+               let d_se_x = smooth_right_elbow.0 - raw_s.0;
+               let d_se_y = smooth_right_elbow.1 - raw_s.1;
+               let len_se = (d_se_x.powi(2) + d_se_y.powi(2)).sqrt();
+               let fixed_elbow = if len_se > 0.001 {
+                   (raw_s.0 + (d_se_x / len_se) * dyn_upper, raw_s.1 + (d_se_y / len_se) * dyn_upper)
+               } else {
+                   smooth_right_elbow
+               };
+               
+               let d_ew_x = target_right_wrist.0 - fixed_elbow.0;
+               let d_ew_y = target_right_wrist.1 - fixed_elbow.1;
+               let len_ew = (d_ew_x.powi(2) + d_ew_y.powi(2)).sqrt();
+               let fixed_wrist = if len_ew > 0.001 {
+                   (fixed_elbow.0 + (d_ew_x / len_ew) * dyn_fore, fixed_elbow.1 + (d_ew_y / len_ew) * dyn_fore)
+               } else {
+                   target_right_wrist
+               };
+               
+               (fixed_elbow, fixed_wrist)
+            }
         };
         
         // Store FINAL positions (bone-constrained) for rendering
@@ -427,10 +507,7 @@ pub fn apply_mediapipe_correction(data: &[f32]) {
         state.left_velocity = state.left_hand.velocity.update(final_left_wrist);
         state.right_velocity = state.right_hand.velocity.update(final_right_wrist);
         
-        // Update extrapolators for latency compensation
-        let now = js_sys::Date::now();
-        state.left_extrapolator.update(final_left_wrist, now);
-        state.right_extrapolator.update(final_right_wrist, now);
+        // [MOVED] Predictors now updated at start of function with raw data
         
         // Store final wrists for smoothed rendering
         state.smoothed_wrists = [final_left_wrist, final_right_wrist];
@@ -606,10 +683,9 @@ pub fn get_smoothed_wrists() -> Option<[(f32, f32); 2]> {
 pub fn get_extrapolated_wrists() -> Vec<f32> {
     STATE.with(|state_cell| {
         let state = state_cell.borrow();
-        let now = js_sys::Date::now();
         
-        let left = state.left_extrapolator.predict(now);
-        let right = state.right_extrapolator.predict(now);
+        let left = state.left_predictor.predicted_pos;
+        let right = state.right_predictor.predicted_pos;
         
         vec![left.0, left.1, right.0, right.1]
     })
@@ -622,23 +698,17 @@ pub fn get_raw_wrists() -> Vec<f32> {
     STATE.with(|state_cell| {
         let state = state_cell.borrow();
         
-        let left = state.left_extrapolator.raw_position();
-        let right = state.right_extrapolator.raw_position();
+        let left = (state.raw_landmarks[LEFT_WRIST].x, state.raw_landmarks[LEFT_WRIST].y);
+        let right = (state.raw_landmarks[RIGHT_WRIST].x, state.raw_landmarks[RIGHT_WRIST].y);
         
         vec![left.0, left.1, right.0, right.1]
     })
 }
 
-/// Set extrapolation parameters (for tuning)
+/// Set extrapolation parameters (Obsolete with LinearPredictor)
 #[wasm_bindgen]
-pub fn set_extrapolation_params(latency_ms: f32, overshoot: f32) {
-    STATE.with(|state_cell| {
-        let mut state = state_cell.borrow_mut();
-        state.left_extrapolator.set_latency(latency_ms);
-        state.left_extrapolator.set_overshoot(overshoot);
-        state.right_extrapolator.set_latency(latency_ms);
-        state.right_extrapolator.set_overshoot(overshoot);
-        web_sys::console::log_1(&format!("⚡ Extrapolation: latency={}ms, overshoot={}x", latency_ms, overshoot).into());
-    });
+pub fn set_extrapolation_params(_latency_ms: f32, _overshoot: f32) {
+    // No-op for now. LinearPredictor uses fixed 50ms lookahead (1.5 frames).
+    web_sys::console::log_1(&"⚡ Extrapolation params are now fixed (LinearPredictor)".into());
 }
 

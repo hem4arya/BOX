@@ -8,11 +8,11 @@ const PIPELINE_LATENCY: f32 = 20.0; // USB/Browser overhead
 const MEDIAPIPE_LATENCY: f32 = 25.0; // Inference time
 const TOTAL_SYSTEM_LATENCY: f32 = 90.0; // Tuned for "Aggressive" latency compensation
 
-/// Overshoot factor (1.1 = predict 10% further for snappier feel)
-const OVERSHOOT: f32 = 1.1;
+/// Overshoot factor (1.2 = predict 20% further for snappier feel)
+const OVERSHOOT: f32 = 1.2;
 
-/// Velocity smoothing factor (0.7 = 70% new, 30% old - very responsive)
-const VELOCITY_ALPHA: f32 = 0.7;
+/// Velocity smoothing factor (0.4 = 40% new, 60% old - better stability)
+const VELOCITY_ALPHA: f32 = 0.4;
 
 /// Extrapolator predicts position ahead based on velocity
 pub struct Extrapolator {

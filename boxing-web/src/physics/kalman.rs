@@ -46,13 +46,15 @@ impl KalmanFilter {
         
         // Process noise - trust physics prediction somewhat
         // Higher values = more responsive, lower = smoother
+        // Process Noise (High Reactivity)
+        // Trust the measurements more, trust the 'smooth physics' less
         let mut process_noise = Matrix6::zeros();
-        process_noise[(0, 0)] = 0.001;  // x position
-        process_noise[(1, 1)] = 0.001;  // y position
-        process_noise[(2, 2)] = 0.01;   // x velocity
-        process_noise[(3, 3)] = 0.01;   // y velocity
-        process_noise[(4, 4)] = 0.1;    // x acceleration
-        process_noise[(5, 5)] = 0.1;    // y acceleration
+        process_noise[(0, 0)] = 0.1;   // x pos (was 0.001) - 100x increase
+        process_noise[(1, 1)] = 0.1;   // y pos (was 0.001)
+        process_noise[(2, 2)] = 1.0;   // x velocity (was 0.01) - 100x increase
+        process_noise[(3, 3)] = 1.0;   // y velocity
+        process_noise[(4, 4)] = 0.1;   // x acceleration
+        process_noise[(5, 5)] = 0.1;   // y acceleration
         
         // Measurement noise - MediaPipe has some jitter
         let measurement_noise = Matrix2::identity() * 0.005;
@@ -131,8 +133,9 @@ impl KalmanFilter {
         let error_x = measured_x - self.state[0];
         let error_y = measured_y - self.state[1];
         
-        // Kalman gain (0.3 = balanced blend)
-        let k = 0.3;
+        // Kalman gain (0.7 = High Reactivity)
+        // 0.3 was too slow (70% physics drag). 0.7 trusts the camera more.
+        let k = 0.7;
         
         // Soft position correction
         self.state[0] += k * error_x;

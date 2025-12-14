@@ -141,6 +141,23 @@ pub fn render_frame() {
             vertices.extend(build_smoothed_vertices([left, right]));
         }
 
+        // EXPERIMENT: Draw RAW MediaPipe Wrists (Yellow Dot) to visualize Input Lag
+        // This comes directly from JS -> Rust Bridge (no physics, no smoothing)
+        let raw_wrists = bridge::get_raw_wrists();
+        if raw_wrists.len() == 4 {
+            let yellow = [1.0, 1.0, 0.0, 1.0];
+            let dot_radius = 0.01; // Small visible dot
+            
+            // Left Raw - Only draw if valid (> 0.001 to avoid corner dots)
+            if raw_wrists[0] > 0.001 && raw_wrists[1] > 0.001 {
+                vertices.extend(create_circle_vertices(raw_wrists[0], raw_wrists[1], dot_radius, yellow, 8));
+            }
+            // Right Raw
+            if raw_wrists[2] > 0.001 && raw_wrists[3] > 0.001 {
+                vertices.extend(create_circle_vertices(raw_wrists[2], raw_wrists[3], dot_radius, yellow, 8));
+            }
+        }
+
         let output = match state.surface.get_current_texture() {
             Ok(t) => t,
             Err(_) => return,

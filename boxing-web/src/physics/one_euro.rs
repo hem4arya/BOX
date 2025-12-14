@@ -36,7 +36,7 @@ impl OneEuroFilter {
     
     /// Boxing-tuned preset - good balance of smoothing and responsiveness
     pub fn for_boxing() -> Self {
-        Self::new(1.0, 0.05)
+        Self::new(1.0, 0.15)
     }
     
     /// Calculate smoothing factor alpha

@@ -307,40 +307,48 @@ async function main() {
     // Using video element (experiment or fallback)
     console.log("🎥 Using <video> element for MediaPipe detection");
 
-    async function detectionLoop() {
-      while (true) {
-        const mpStart = performance.now();
-        const results = poseLandmarker.detectForVideo(video, performance.now());
-        const mpTime = performance.now() - mpStart;
+    // Using video element (fallback) with requestVideoFrameCallback for sync/backpressure
+    console.log("🎥 Using <video> element with requestVideoFrameCallback");
 
-        stats.setMediapipe(mpTime);
-        set_mediapipe_latency(mpTime);
-
-        if (results.landmarks && results.landmarks[0]) {
-          const landmarks = results.landmarks[0];
-          const flatArray = new Float32Array(landmarks.length * 3);
-          landmarks.forEach((lm, i) => {
-            flatArray[i * 3] = lm.x;
-            flatArray[i * 3 + 1] = lm.y;
-            flatArray[i * 3 + 2] = lm.z;
-          });
-          apply_mediapipe_correction(flatArray);
-        }
-
-        await new Promise((r) => setTimeout(r, 0));
+    function onVideoFrame(now, metadata) {
+      if (!video.videoWidth) {
+        video.requestVideoFrameCallback(onVideoFrame);
+        return;
       }
+
+      const mpStart = performance.now();
+      // Use the video element directly. MediaPipe will grab the current frame source.
+      const results = poseLandmarker.detectForVideo(video, mpStart);
+      const mpTime = performance.now() - mpStart;
+
+      stats.setMediapipe(mpTime);
+      set_mediapipe_latency(mpTime);
+
+      if (results.landmarks && results.landmarks[0]) {
+        const landmarks = results.landmarks[0];
+        const flatArray = new Float32Array(landmarks.length * 3);
+        landmarks.forEach((lm, i) => {
+          flatArray[i * 3] = lm.x;
+          flatArray[i * 3 + 1] = lm.y;
+          flatArray[i * 3 + 2] = lm.z;
+        });
+        apply_mediapipe_correction(flatArray);
+      }
+
+      // Re-queue
+      video.requestVideoFrameCallback(onVideoFrame);
     }
 
     video.addEventListener("loadeddata", () => {
       lastRenderTime = performance.now();
       requestAnimationFrame(renderLoop);
-      detectionLoop();
+      video.requestVideoFrameCallback(onVideoFrame);
     });
 
     if (video.readyState >= 2) {
       lastRenderTime = performance.now();
       requestAnimationFrame(renderLoop);
-      detectionLoop();
+      video.requestVideoFrameCallback(onVideoFrame);
     }
   }
 }

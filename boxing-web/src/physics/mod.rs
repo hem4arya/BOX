@@ -11,6 +11,7 @@ mod one_euro;
 mod kinematic_constraints;
 mod detection;
 mod extrapolation;
+mod linear_predictor;
 mod confidence_gate;
 mod arm_ik;
 
@@ -23,5 +24,6 @@ pub use one_euro::{OneEuroFilter, OneEuroFilter2D};
 pub use kinematic_constraints::{KinematicConstraints, clamp_velocity, reject_outlier, clamp_elbow_angle};
 pub use detection::{PunchDetector, PunchType};
 pub use extrapolation::Extrapolator;
+pub use linear_predictor::LinearPredictor;
 pub use confidence_gate::ConfidenceGate;
 pub use arm_ik::ArmIK;
