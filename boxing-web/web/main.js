@@ -10,7 +10,7 @@ import init, {
   init as wasmInit,
   render_frame,
   physics_tick,
-  calibrate_depth,
+  calibrate_hand,
   apply_hand_landmarks,
   set_frame_metrics,
   set_mediapipe_latency,
@@ -131,16 +131,16 @@ let calibrationInterval = null;
 function startCalibrationCountdown() {
   if (calibrationInterval) return;
   calibrationCountdown = 3;
-  status.textContent = `✋ Hold hands open in ${calibrationCountdown}...`;
+  status.textContent = `✋ Hold hands OPEN & FLAT in ${calibrationCountdown}...`;
   calibrationInterval = setInterval(() => {
     calibrationCountdown--;
     if (calibrationCountdown > 0) {
-      status.textContent = `✋ Hold hands open in ${calibrationCountdown}...`;
+      status.textContent = `✋ Hold hands OPEN & FLAT in ${calibrationCountdown}...`;
     } else {
       clearInterval(calibrationInterval);
       calibrationInterval = null;
-      calibrate_depth();
-      status.textContent = "✅ Calibrated! Move your hands.";
+      calibrate_hand(); // Calibrate hand bone lengths
+      status.textContent = "✅ Hand Calibrated! Finger lengths locked.";
     }
   }, 1000);
 }

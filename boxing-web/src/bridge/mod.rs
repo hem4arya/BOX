@@ -41,7 +41,9 @@ pub use classifier_integration::{
 
 pub use hand_landmarks::{
     apply_hand_landmarks,
+    calibrate_hand,
     get_hand_data,
+    is_hand_calibrated,
     HandData,
     HandLandmark,
     HAND_SKELETON,

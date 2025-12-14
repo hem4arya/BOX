@@ -18,6 +18,7 @@ pub use bridge::{
     calibrate_depth, 
     apply_mediapipe_correction,
     apply_hand_landmarks,
+    calibrate_hand,
     get_extrapolated_wrists,
     get_raw_wrists,
     set_extrapolation_params,
