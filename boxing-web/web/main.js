@@ -5,13 +5,13 @@ if (!navigator.gpu) {
   throw new Error("WebGPU not supported");
 }
 
-import { PoseLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+import { HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 import init, {
   init as wasmInit,
   render_frame,
   physics_tick,
   calibrate_depth,
-  apply_mediapipe_correction,
+  apply_hand_landmarks,
   set_frame_metrics,
   set_mediapipe_latency,
   set_physics_time,
@@ -90,9 +90,8 @@ class StatsMonitor {
         : this.mediapipeMs > 25
         ? "#ffaa00"
         : "#00ff00";
-    const camColor = this.cameraLatency > 50 ? "#ff4444" : "#00ff00";
 
-    // Get arm debug info from WASM
+    // Get debug info from WASM
     try {
       this.armInfo = get_debug_overlay_text();
     } catch (e) {
@@ -104,15 +103,12 @@ class StatsMonitor {
       <b>Frame:</b> <span style="color:${frameColor}">${this.frameMs.toFixed(
       1
     )}ms</span><br>
-      <b>Camera:</b> <span style="color:${camColor}">${this.cameraLatency.toFixed(
-      0
-    )}ms</span><br>
       <b>MediaPipe:</b> <span style="color:${mpColor}">${this.mediapipeMs.toFixed(
       0
     )}ms</span><br>
       <b>Physics:</b> ${this.physicsMs.toFixed(2)}ms<br>
       <span style="color:#0ff">${this.armInfo.replace(/\n/g, "<br>")}</span><br>
-      <span style="color:#888">VideoFrame API ✓</span>
+      <span style="color:#888">🖐️ Hand Tracking Mode</span>
     `;
   }
 }
@@ -126,25 +122,25 @@ const video = document.getElementById("camera-video");
 const stats = new StatsMonitor();
 
 let lastRenderTime = 0;
-let poseLandmarker = null;
+let handLandmarker = null;
 
-// Calibration
+// Calibration (not used for hands but kept for compatibility)
 let calibrationCountdown = 0;
 let calibrationInterval = null;
 
 function startCalibrationCountdown() {
   if (calibrationInterval) return;
-  calibrationCountdown = 5;
-  status.textContent = `📐 T-POSE in ${calibrationCountdown}...`;
+  calibrationCountdown = 3;
+  status.textContent = `✋ Hold hands open in ${calibrationCountdown}...`;
   calibrationInterval = setInterval(() => {
     calibrationCountdown--;
     if (calibrationCountdown > 0) {
-      status.textContent = `📐 T-POSE in ${calibrationCountdown}...`;
+      status.textContent = `✋ Hold hands open in ${calibrationCountdown}...`;
     } else {
       clearInterval(calibrationInterval);
       calibrationInterval = null;
       calibrate_depth();
-      status.textContent = "✅ Calibrated! Punch to detect.";
+      status.textContent = "✅ Calibrated! Move your hands.";
     }
   }, 1000);
 }
@@ -153,82 +149,61 @@ async function main() {
   status.textContent = "Loading WASM...";
   await init();
   await wasmInit();
-  console.log("🥊 Boxing Web WASM loaded");
+  console.log("🖐️ Hand Tracking WASM loaded");
 
   // ========================================================================
-  // TIER 1 FIX #1: LOW-LATENCY CAMERA CONSTRAINTS
+  // LOW-LATENCY CAMERA
   // ========================================================================
-  status.textContent = "Requesting camera (low-latency mode)...";
+  status.textContent = "Requesting camera...";
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: {
         width: { ideal: 640, max: 640 },
-        height: { ideal: 360, max: 360 }, // Lower res = faster
+        height: { ideal: 360, max: 360 },
         frameRate: { ideal: 30, max: 30 },
         facingMode: "user",
-        // Low-latency hints (browser may ignore)
-        latency: { ideal: 0 },
-        resizeMode: "none",
       },
       audio: false,
     });
 
-    // Disable auto-adjustments that cause delays
-    const track = stream.getVideoTracks()[0];
-    const capabilities = track.getCapabilities?.() || {};
-    const constraints = {};
-
-    if (capabilities.exposureMode?.includes("manual")) {
-      constraints.exposureMode = "manual";
-    }
-    if (capabilities.focusMode?.includes("manual")) {
-      constraints.focusMode = "manual";
-    }
-    if (capabilities.whiteBalanceMode?.includes("manual")) {
-      constraints.whiteBalanceMode = "manual";
-    }
-
-    if (Object.keys(constraints).length > 0) {
-      await track.applyConstraints({ advanced: [constraints] });
-      console.log("📷 Camera: manual mode applied", constraints);
-    }
-
-    console.log("📷 Camera: low-latency constraints applied");
+    console.log("📷 Camera ready");
   } catch (err) {
     status.textContent = "❌ Camera access denied";
     console.error("Camera error:", err);
     return;
   }
 
-  // Keep video element for fallback/preview
   video.srcObject = stream;
   await video.play();
 
-  status.textContent = "Loading MediaPipe...";
+  // ========================================================================
+  // HAND LANDMARKER (21 landmarks per hand, up to 2 hands)
+  // ========================================================================
+  status.textContent = "Loading MediaPipe Hand Tracking...";
   const vision = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
   );
 
-  poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
     baseOptions: {
       modelAssetPath:
-        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
       delegate: "GPU",
     },
     runningMode: "VIDEO",
-    numPoses: 1,
+    numHands: 2,
   });
 
-  console.log("🤖 MediaPipe ready");
-  status.textContent = "✅ Ready - Press C to calibrate";
+  console.log("🖐️ MediaPipe Hand Tracking ready");
+  status.textContent = "✅ Ready - Show your hands!";
 
   document.addEventListener("keydown", (e) => {
     if (e.key === "c" || e.key === "C") startCalibrationCountdown();
   });
 
   // ========================================================================
-  // RENDER LOOP (120Hz) - Independent, never waits for MediaPipe
+  // RENDER LOOP (120Hz) - Independent
   // ========================================================================
   function renderLoop(timestamp) {
     stats.begin();
@@ -249,107 +224,58 @@ async function main() {
   }
 
   // ========================================================================
-  // TIER 1 FIX #2: VIDEOFRAME API (Zero-buffering)
+  // DETECTION LOOP (requestVideoFrameCallback for smooth sync)
   // ========================================================================
-  const videoTrack = stream.getVideoTracks()[0];
+  function onVideoFrame(now, metadata) {
+    if (!video.videoWidth) {
+      video.requestVideoFrameCallback(onVideoFrame);
+      return;
+    }
 
-  // EXPERIMENT: Force video element instead of VideoFrame API
-  const USE_VIDEO_ELEMENT = true;
+    const mpStart = performance.now();
+    const results = handLandmarker.detectForVideo(video, mpStart);
+    const mpTime = performance.now() - mpStart;
 
-  // Check if VideoFrame API is supported
-  if (!USE_VIDEO_ELEMENT && typeof MediaStreamTrackProcessor !== "undefined") {
-    console.log("🎬 Using VideoFrame API (zero-buffering)");
+    stats.setMediapipe(mpTime);
+    set_mediapipe_latency(mpTime);
 
-    const trackProcessor = new MediaStreamTrackProcessor({ track: videoTrack });
-    const reader = trackProcessor.readable.getReader();
+    // Process each detected hand
+    // Hand 0 = Left hand (from camera view, appears on right side)
+    // Hand 1 = Right hand (from camera view, appears on left side)
+    if (results.landmarks && results.landmarks.length > 0) {
+      // Flatten all hand landmarks: [hand0_lm0_x, y, z, hand0_lm1_x, y, z, ..., hand1_lm0_x, ...]
+      // 21 landmarks per hand, 3 floats per landmark = 63 floats per hand
+      // Up to 2 hands = 126 floats max
+      const numHands = results.landmarks.length;
+      const flatArray = new Float32Array(numHands * 21 * 3);
 
-    async function processVideoFrames() {
-      while (true) {
-        try {
-          const { value: frame, done } = await reader.read();
-          if (done) break;
-
-          // Calculate camera-to-process latency
-          const captureTime = frame.timestamp / 1000; // microseconds to ms
-          const now = performance.now();
-          stats.setCameraLatency(now - captureTime);
-
-          // Run MediaPipe on raw frame (no video element buffering!)
-          const mpStart = performance.now();
-          const results = poseLandmarker.detectForVideo(frame, now);
-          stats.setMediapipe(performance.now() - mpStart);
-          set_mediapipe_latency(performance.now() - mpStart);
-
-          // CRITICAL: Close frame to release memory
-          frame.close();
-
-          if (results.landmarks && results.landmarks[0]) {
-            const landmarks = results.landmarks[0];
-            const flatArray = new Float32Array(landmarks.length * 3);
-            landmarks.forEach((lm, i) => {
-              flatArray[i * 3] = lm.x;
-              flatArray[i * 3 + 1] = lm.y;
-              flatArray[i * 3 + 2] = lm.z;
-            });
-            apply_mediapipe_correction(flatArray);
-          }
-        } catch (err) {
-          console.error("VideoFrame error:", err);
-          break;
+      for (let h = 0; h < numHands; h++) {
+        const hand = results.landmarks[h];
+        for (let i = 0; i < 21; i++) {
+          const lm = hand[i];
+          const base = h * 21 * 3 + i * 3;
+          flatArray[base] = lm.x;
+          flatArray[base + 1] = lm.y;
+          flatArray[base + 2] = lm.z;
         }
       }
+
+      apply_hand_landmarks(flatArray, numHands);
     }
 
-    processVideoFrames();
+    video.requestVideoFrameCallback(onVideoFrame);
+  }
+
+  video.addEventListener("loadeddata", () => {
     lastRenderTime = performance.now();
     requestAnimationFrame(renderLoop);
-  } else {
-    // Using video element (experiment or fallback)
-    console.log("🎥 Using <video> element for MediaPipe detection");
+    video.requestVideoFrameCallback(onVideoFrame);
+  });
 
-    // Using video element (fallback) with requestVideoFrameCallback for sync/backpressure
-    console.log("🎥 Using <video> element with requestVideoFrameCallback");
-
-    function onVideoFrame(now, metadata) {
-      if (!video.videoWidth) {
-        video.requestVideoFrameCallback(onVideoFrame);
-        return;
-      }
-
-      const mpStart = performance.now();
-      // Use the video element directly. MediaPipe will grab the current frame source.
-      const results = poseLandmarker.detectForVideo(video, mpStart);
-      const mpTime = performance.now() - mpStart;
-
-      stats.setMediapipe(mpTime);
-      set_mediapipe_latency(mpTime);
-
-      if (results.landmarks && results.landmarks[0]) {
-        const landmarks = results.landmarks[0];
-        const flatArray = new Float32Array(landmarks.length * 3);
-        landmarks.forEach((lm, i) => {
-          flatArray[i * 3] = lm.x;
-          flatArray[i * 3 + 1] = lm.y;
-          flatArray[i * 3 + 2] = lm.z;
-        });
-        apply_mediapipe_correction(flatArray);
-      }
-
-      // Re-queue
-      video.requestVideoFrameCallback(onVideoFrame);
-    }
-
-    video.addEventListener("loadeddata", () => {
-      lastRenderTime = performance.now();
-      requestAnimationFrame(renderLoop);
-      video.requestVideoFrameCallback(onVideoFrame);
-    });
-
-    if (video.readyState >= 2) {
-      lastRenderTime = performance.now();
-      requestAnimationFrame(renderLoop);
-      video.requestVideoFrameCallback(onVideoFrame);
-    }
+  if (video.readyState >= 2) {
+    lastRenderTime = performance.now();
+    requestAnimationFrame(renderLoop);
+    video.requestVideoFrameCallback(onVideoFrame);
   }
 }
 

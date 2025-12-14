@@ -17,6 +17,7 @@ pub use bridge::{
     physics_tick, 
     calibrate_depth, 
     apply_mediapipe_correction,
+    apply_hand_landmarks,
     get_extrapolated_wrists,
     get_raw_wrists,
     set_extrapolation_params,

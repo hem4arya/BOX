@@ -5,6 +5,7 @@
 
 mod landmarks;
 mod classifier_integration;
+mod hand_landmarks;
 
 pub use landmarks::{
     // WASM entry points
@@ -36,4 +37,12 @@ pub use classifier_integration::{
     is_buffer_ready,
     get_last_punch, 
     is_classifier_ready
+};
+
+pub use hand_landmarks::{
+    apply_hand_landmarks,
+    get_hand_data,
+    HandData,
+    HandLandmark,
+    HAND_SKELETON,
 };
